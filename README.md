@@ -1,99 +1,222 @@
-# Launch Engineering review agent
+# Launch Engineering Review Agent
 
-A local five-second listener for the dedicated Google Chat review space. It durably queues coworker PRs, acknowledges in the original thread, runs one sequential Falcon review through Codex, submits a commit-anchored GitHub review, and replies with the result. The old MCP monitor stays paused.
+Automated pull request reviews requested through a dedicated Google Chat space. The agent acknowledges a request, reviews a captured commit using Falcon criteria, submits an approval or request for changes on GitHub, and reports the outcome in the original Chat thread.
 
-This repository stores the source code. Execution remains on the Mac running the agent; pushing code to GitHub does not deploy a cloud service or start reviews.
+The service runs locally on macOS. A lightweight Python listener handles intake independently of one sequential review worker, so incoming requests can be acknowledged while another review is running. Model inference runs remotely through the authenticated Codex CLI; idle polling does not invoke a model.
 
-## Local installation
+## Using the agent
 
-On macOS with Python 3.10 or later:
+Post a GitHub pull request URL in the [review space](https://chat.google.com/u/0/app/chat/AAQAixK3auw). A tag is not required in this dedicated space, and teammates do not need to authorize the agent individually.
 
-    python3 -m venv .venv
-    .venv/bin/python -m pip install -r requirements.lock
+```text
+https://github.com/ROKT/launch-engineering/pull/1234
+```
 
-The existing local installation is already authorized; cloning the source alone does not copy its credentials. Keep downloaded OAuth client JSON and all runtime data out of Git. The virtual environment, runtime state, activity logs and local progress notes are ignored.
+| Reaction | Meaning | Thread response |
+| --- | --- | --- |
+| 👀 | Request received and queued | Acknowledgment; duplicate requests reference the original request time. |
+| ✅ | Approved | Review summary, GitHub review link, and commit SHA. |
+| 💬 | Changes requested | Explanation, GitHub review link, and commit SHA. |
+| ⚠️ | Review held or skipped | Reason and, where applicable, the next action. |
 
-## Configure and run
+Reactions are additive: 👀 remains as the receipt. The latest thread response explains the current state. Reposting the same reviewed commit reuses the existing result without another model review. A new commit can receive a fresh review.
 
-This Mac is configured for `spaces/AAQAixK3auw`. On a fresh installation, configure once:
+Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Requests from the operator's own Chat identity, bot messages, and PRs authored by either configured operator GitHub identity are excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
 
-    .venv/bin/python agent.py configure --space https://chat.google.com/u/0/app/chat/AAQAixK3auw
+### STAMP exception
 
-This records a new activation time in `.runtime/config.json`; older messages are excluded. Configuration refuses to overwrite an existing activation/cursor. This pilot reads and writes only this exact space. Teammates post a supported PR link there without needing to tag Justin or authorize the agent themselves. Messages from Justin and bots are excluded.
+Only the Google Chat identity verified as `mani.vedma@rokt.com` may request:
 
-Verify the existing grant and exact space, then run the foreground pilot:
+```text
+https://github.com/ROKT/launch-engineering/pull/1234 STAMP
+```
 
-    .venv/bin/python agent.py check-chat
-    .venv/bin/python agent.py run
+STAMP submits an approval **without code review** and says so explicitly on GitHub and in the Chat thread. It never merges. The sender must be verified from Google-provided identity fields; a name or email pasted into a message cannot authorize this action. Repository, PR state, CI, duplicate, account, and current-head checks still apply. A moved head requires a new explicit STAMP request. Repository folder URLs cannot identify a PR.
 
-Stop with Ctrl-C. Restarting preserves requests, outbox messages, pagination and review intents. Do not run another instance; the process lock rejects it. The small listener continues polling and acknowledging while the independent review thread waits for Codex. No model starts on an empty poll. Sleep pauses execution naturally; no keep-awake assertion is used.
+## Architecture
 
-Supported review/context repository: `ROKT/launch-engineering` only. GitHub actor: `justinlee1253`, verified from GitHub before each submission; accounts are never switched. PRs authored by either Justin account, closed/merged PRs and drafts do not receive automatic reviews. Drafts or inaccessible evidence pause for attention.
+```mermaid
+flowchart LR
+    chat["Google Chat API<br/>Dedicated review space"]
+    subgraph mac["Local macOS runtime"]
+        listener["Python listener<br/>Polling and thread delivery"]
+        queue[("SQLite<br/>Queue, outbox, review ledger")]
+        worker["Python review worker<br/>One PR at a time"]
+        keychain["macOS Keychain<br/>Google OAuth grant"]
+        policy["Falcon skill<br/>Review policy and repository guidance"]
+    end
+    codex["Codex CLI → remote model<br/>Source evidence / structured JSON"]
+    github["GitHub REST API via gh<br/>PR, source, CI status, reviews"]
+    listener -->|Poll / thread replies| chat
+    listener -->|Durable intake| queue
+    queue -->|Claim next PR| worker
+    keychain -->|OAuth grant| listener
+    policy -->|Review criteria| worker
+    worker -->|Evidence / JSON| codex
+    worker -->|Read / publish| github
+```
 
-## Review behavior and safety
+[Interactive architecture diagram](docs/diagrams/architecture.html) · [Mermaid source](docs/diagrams/architecture.mmd)
 
-The host reconstructs full text diffs from verified Git blobs at the captured head and merge base, loads applicable repository instructions, and provides surrounding evidence. Codex can request more files/directories in the approved repository. Related-service `main` reads are pinned to a full SHA for the entire review. Additional repositories require a deliberate future allowlist change; unavailable required context pauses the review.
+The interactive diagram is a standalone HTML file; download it and open it in a browser. Its evidence links identify the inspected source revision. The diagram shows component boundaries, not deployment readiness.
 
-The model gets the installed Falcon skill and [review-policy.md](review-policy.md). All review lenses run sequentially. Material blockers, vulnerabilities, correctness and consequential design flaws matter; style and preferred abstractions do not. Complete reviews with no blockers approve; substantiated blockers request changes. Tests/builds are never executed on PR code, and CI is not claimed to pass.
+### Request lifecycle
 
-GitHub and Chat writes are outside the model. The subprocess uses saved Codex authentication with user configuration, plugins, apps, shell, browser, hooks and agent tools disabled. Structured evidence requests are validated by the host, not executed as commands. Runtime source context is temporary and is not committed. Codex analysis uses the remote model; the program and queue run locally.
+1. **Receive.** The listener polls only the configured space every two seconds on a healthy connection. It persists eligible requests and queues the acknowledgment and 👀 reaction before advancing the scan checkpoint.
+2. **Schedule.** A SQLite queue selects requests in original posting order. One worker processes a PR at a time; the listener continues receiving requests. Reposts attach to active work instead of creating another review.
+3. **Check eligibility.** The worker verifies the GitHub account, PR state, existing reviews, and CI status before spending model tokens. Pending CI waits; failed CI, drafts, merged/closed PRs, and conflicts produce a held result.
+4. **Collect evidence.** GitHub REST reads retrieve complete text changes and relevant files at captured commit SHAs. The worker includes repository instructions, local architecture context, Falcon criteria, and the review policy. Additional evidence requests are restricted to approved files and directories.
+5. **Review.** The Codex subprocess returns structured findings or requests for more evidence. The host validates completeness and file/line references. Missing required context cannot produce an approval.
+6. **Publish.** The host rechecks account, head, PR state, CI, and intervening manual decisions, then reserves and submits one commit-anchored GitHub review. It queues the verdict and reaction for delivery to the original Chat thread.
 
-Submissions reserve their intended event/head/marker before writing. The worker checks current head/state/actor and intervening Justin reviews, deduplicates by repository/PR/head/actor, and reconciles lost responses against the GitHub timeline. An uncertain write is held for attention, never blindly repeated. A head change requeues a fresh review; an already-submitted result is anchored to its old commit and recorded as stale. GitHub does not provide an atomic latest-head review guarantee.
+The model cannot publish directly. Shell, browser, plugins, MCP connections, hooks, and agent tools are disabled in the review subprocess. Python owns all validated evidence reads and external writes. Google Chat uses the REST API directly; GitHub REST requests use `gh api`. Neither Chat MCP nor GitHub MCP is required by this runtime.
 
-The pilot pauses rather than approving binary/symlink/submodule changes, files over 250 KB, more than 150 changed files, inaccessible evidence, or context beyond 1.2 million serialized characters. It bounds evidence requests to eight model rounds and each model invocation to ten minutes. These limits are visible failures, not partial approvals.
+## Review policy
 
-## Status, history, and recovery
+Reviews prioritize material correctness bugs, vulnerabilities, broken contracts, data loss, reliability failures, and consequential design flaws. Formatting preferences, naming tastes, speculative rewrites, and missing tests alone do not block a merge. A complete review with no material blockers approves; substantiated blockers request changes.
 
-    .venv/bin/python agent.py status
-    .venv/bin/python agent.py history
+The review inputs are:
 
-History includes request states, GitHub review IDs/URLs, full SHAs and recent events. SQLite stores message IDs/timestamps/threads, not incoming message bodies. Authored outgoing acknowledgments/reviews are retained for idempotent delivery. Review payloads are in `.runtime/payloads/`; activity logs rotate at 1 MB with three backups. The local runtime directory is owner-only and excluded from Git. Keep its database and WAL files together when backing it up; do not delete it to fix a connection.
+- The installed Falcon skill, currently loaded from `~/.codex/skills/avengers-falcon/SKILL.md`.
+- The agent-specific [review policy](review-policy.md), which defines automation permissions and overrides interactive skill behavior.
+- Repository guidance and source evidence at captured SHAs, plus required local architecture references.
 
-A Google authorization/permission failure sets a durable pause. No background path opens OAuth or a browser. After deliberately repairing the actual cause, verify and explicitly resume:
+The configured model is GPT-6.1 Sol with Fast service and `xhigh` reasoning. Settings and reference credit rates live in [usage.py](usage.py). All review lenses run sequentially.
 
-    .venv/bin/python agent.py check-chat --resume
+## Operator setup
 
-For genuinely revoked grants, use the explicit authorization repair below before this check. Repeating a heartbeat or restarting does not clear the pause. A failed Chat result delivery does not repeat a successful GitHub review. After investigating a paused review:
+### Prerequisites
 
-    .venv/bin/python agent.py retry JOB_ID
+- macOS with Python 3.10 or later and an available login Keychain.
+- GitHub CLI (`gh`) authenticated as the configured review account, with repository access and permission to submit reviews.
+- Codex CLI (`codex`) authenticated and able to use the configured model and service tier.
+- A Google Cloud Desktop OAuth client for the configured project, Google Chat API enabled, and access to the dedicated space.
+- The Falcon skill and local repository context files required by `GitHub.local_context()` in [review.py](review.py). Missing context holds the review.
 
-A reserved/ambiguous write is retried only as timeline reconciliation, never as another submission. A job without a reserved write receives a fresh review. Repairing auth is separate from retrying a review.
+This implementation contains deployment-specific identities and project settings in [auth.py](auth.py) and [agent.py](agent.py). Adapt those deliberately when deploying for a different operator. Repository access is restricted by an explicit allowlist; related-service context outside it is unavailable until enabled.
 
-## Background operation
+### Install dependencies
 
-After one real coworker pilot request has completed, stop the foreground process and install the single login service:
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.lock
+```
 
-    .venv/bin/python launch_agent.py install
-    .venv/bin/python launch_agent.py status
+### Authorize Google and verify renewal
 
-The installer refuses startup before a real submitted pilot review is in this runtime's ledger. It creates `~/Library/LaunchAgents/com.jklee.launch-eng-review-agent.plist`, using absolute executable paths, background scheduling, a 30-second restart throttle, and the same process lock. The plist contains no tokens. Logs are written by the rotating application logger; raw subprocess output is not sent to launchd logs. `launch_agent.py render` previews the exact definition without installing it. `launch_agent.py stop` unloads the service.
+On a fresh installation, use the downloaded Desktop OAuth client file:
 
-This runs while the laptop is awake. Automatic login startup is a separate rollout step from building and testing the worker. Do not resume the older MCP heartbeat.
+```bash
+.venv/bin/python auth.py authorize --client-file /absolute/path/to/client.json
+.venv/bin/python auth.py check --force-refresh
+```
 
-## Authorization and checks
+The supported Google OAuth library requests offline access and verifies that a refresh token was issued. The grant is stored in macOS Keychain. Background operation renews access tokens silently and never opens an authorization browser.
 
-The source and virtual environment live in this directory on Justin's Mac. Google grants are stored in macOS Keychain under service com.rokt.le-orbit-review.google-chat and the account label justin.lee@rokt.com. No token JSON is stored in this project. The account label and browser login hint are configuration, not independent proof of the Google account's identity.
+Required scopes:
 
-From this directory, inspect non-secret health:
+```text
+https://www.googleapis.com/auth/chat.messages.readonly
+https://www.googleapis.com/auth/chat.messages.create
+https://www.googleapis.com/auth/chat.messages.reactions.create
+```
 
-    .venv/bin/python auth.py status
+An existing grant should be checked rather than authorized again. Revocation or policy changes can still invalidate authorization; the runtime pauses and records the failure rather than repeatedly prompting. Keep OAuth client files and grants out of Git, Chat messages, and logs.
 
-Test renewal without a browser:
+### Configure and start
 
-    .venv/bin/python auth.py check --force-refresh
+```bash
+.venv/bin/python agent.py configure --space https://chat.google.com/u/0/app/chat/AAQAixK3auw
+.venv/bin/python agent.py check-chat
+.venv/bin/python agent.py run
+```
 
-Ordinary background credential loading uses CredentialManager.load(). It renews expired access tokens, persists the updated grant and never invokes an interactive flow. Permanent authorization errors persist a blocked flag in .runtime/auth-state.json. Transport failures preserve the grant without labeling it revoked. File locking serializes credential operations across processes.
+Configuration records an activation timestamp and refuses to overwrite existing state. Older messages are excluded. Runtime files are created under `.runtime/`, which is excluded from Git. Stop the foreground process with Ctrl-C.
 
-Initial setup has already succeeded for the downloaded Desktop client associated with project le-orbit-review. The only interactive command is:
+Polling and reaction settings live in `.runtime/config.json`. The current supported polling interval is two seconds. The reaction mapping is:
 
-    .venv/bin/python auth.py authorize --client-file /absolute/path/to/downloaded-client.json
+```json
+{
+  "picked_up": "👀",
+  "approved": "✅",
+  "changes_requested": "💬",
+  "warning": "⚠️"
+}
+```
 
-An existing grant prevents this command from opening another consent page. Deliberate repair after a genuine revocation additionally requires --reauthorize. Do not run repair during normal operation. Authorization requests use exactly the three agreed Chat scopes, offline access, generated PKCE, the OAuth library's state verification and a loopback callback.
+These keys belong under `reactions`. Preserve the configured space, activation timestamp, and database when changing presentation settings. Restart the process after editing configuration.
 
-Run focused local tests:
+### Enable login startup
 
-    .venv/bin/python -m unittest discover -v
+After a real pilot request has completed successfully, stop the foreground process and install the macOS LaunchAgent:
 
-Verified on 2026-10-26: initial browser authorization, refresh token presence, Keychain persistence, repeated successful forced renewal from separate processes without another sign-in, and real reads of the designated Chat space. The focused suite covers expired-token refresh, revocation pause, queue/pagination restart, same-head deduplication, missing evidence, moved heads, ambiguous writes, verified inline findings, and listener responsiveness during a blocked review. A naturally elapsed token-expiry cycle, real teammate acknowledgment timing, and a complete real pilot review still require live acceptance. Initial login alone does not prove unattended renewal or permanent credentials.
+```bash
+.venv/bin/python launch_agent.py render
+.venv/bin/python launch_agent.py install
+.venv/bin/python launch_agent.py status
+```
 
-Do not paste client JSON or grants into Chat or logs. The old MCP authentication block is independent of this new direct API setup and has not been cleared.
+The installer requires verified Google renewal and a submitted pilot review in the local ledger. It installs one login service with a process lock, background scheduling, and restart throttling. It runs while the Mac is awake and does not keep the computer awake. Pushing this repository to GitHub does not deploy or start the service.
+
+## Operations
+
+| Command | Purpose |
+| --- | --- |
+| `.venv/bin/python agent.py status` | Scan checkpoint, queue counts, delivery state, and authentication health. |
+| `.venv/bin/python agent.py history` | Request outcomes, review IDs/URLs, captured SHAs, and recent events. |
+| `.venv/bin/python agent.py costs` | Model token usage and reference credit estimates, including failed runs where reported. |
+| `.venv/bin/python auth.py status` | Non-secret Google authorization health. |
+| `.venv/bin/python launch_agent.py stop` | Unload the login service. |
+
+Cost records distinguish measured token usage from estimates. Unreported usage remains unknown; it is not recorded as zero. Reference credit estimates are not invoices or account-specific dollar charges.
+
+### Holds and recovery
+
+| Condition | Behavior |
+| --- | --- |
+| CI still running | Waits and checks again before starting analysis. |
+| Failed/cancelled CI, draft, conflicts, empty diff, merged/closed PR | Holds or skips; thread explains the reason. |
+| Head/base changes during review | Cancels obsolete work and queues a fresh review after a stability delay; repeated changes hold for attention. |
+| Head changes during submission | Records the submitted review against its old commit and marks it stale. |
+| Existing review of the same head | Reuses the result and links it; no additional review. |
+| Intervening manual review or blocking decision | Holds for operator attention. |
+| Incomplete evidence, model failure, wrong account, or inaccessible repository | Holds; never converts missing evidence into approval. |
+| Uncertain GitHub write response | Reconciles author, head, event, and stable marker against the review timeline; never blindly repeats the write. |
+| Google authorization failure | Durably pauses Chat access; no repeated consent prompts. |
+
+After repairing a Chat connection, verify and explicitly resume:
+
+```bash
+.venv/bin/python agent.py check-chat --resume
+```
+
+Only a genuinely invalid Google grant requires explicit repair with `auth.py authorize --client-file ... --reauthorize`, followed by renewal verification. After investigating a held review, an operator can use `agent.py retry JOB_ID`. Reserved writes receive reconciliation only. STAMP requests without a reserved write require a fresh request from Mani.
+
+### Local data
+
+`.runtime/state.sqlite3` stores queue state, message resource IDs/timestamps/threads, outgoing replies, review intents, usage, and the review ledger. Incoming message bodies are not retained. `.runtime/payloads/` contains outgoing GitHub review payloads. `.runtime/activity.log` rotates at 1 MB with three backups. The runtime directory is owner-only; credentials remain in Keychain or the respective CLI's authentication storage.
+
+Preserve the SQLite database and its WAL files together when backing up. Deleting state can lose pending work and deduplication history. A failed Chat delivery does not repeat a successful GitHub review.
+
+## Development
+
+| File | Responsibility |
+| --- | --- |
+| [agent.py](agent.py) | Space-scoped intake, durable queue/outbox, reactions, supervision, operator CLI. |
+| [auth.py](auth.py) | Explicit Google authorization, Keychain storage, silent renewal, and pause behavior. |
+| [review.py](review.py) | Fixed-commit evidence, bounded model analysis, validation, and GitHub publishing. |
+| [review-policy.md](review-policy.md), [review.schema.json](review.schema.json) | Review instructions and structured result contract. |
+| [usage.py](usage.py) | Model settings, reported token accounting, and reference credit estimates. |
+| [launch_agent.py](launch_agent.py) | Login service definition and controlled installation. |
+
+Run the focused local checks:
+
+```bash
+.venv/bin/python -m unittest discover -v
+```
+
+The suite uses fixtures for authorization, queue recovery, deduplication, evidence validation, changed heads, ambiguous writes, and listener responsiveness. It does not execute code from reviewed PRs. Reviews also do not run repository builds or test suites; GitHub review text states this limitation.
+
+The text-review limits are 150 changed files, 250 KB per file, 1.2 million serialized context characters, up to eight evidence rounds, and ten minutes per model invocation. Binary files, symlinks, submodules, inaccessible required context, and exceeded limits hold for manual attention. A GitHub review is anchored to a commit; the API does not provide an atomic guarantee that it remains the latest head.
+
+Deployment acceptance must include a real threaded acknowledgment, the correct GitHub review identity, same-head deduplication, restart recovery, and silent token renewal. Unit tests and initial login alone do not establish live readiness.

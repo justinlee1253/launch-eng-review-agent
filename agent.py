@@ -15,19 +15,22 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 import requests
 
 from auth import AuthRequired, ConfigError, CredentialManager, TemporaryAuthError
+import usage
 
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME = ROOT / '.runtime'
 REPOS = ('ROKT/launch-engineering',)
 SELF_USER = 'users/104386993234033491963'
+STAMP_EMAIL = 'mani.vedma@rokt.com'
+REACTIONS = {'picked_up': '👀', 'approved': '✅', 'changes_requested': '💬', 'warning': '⚠️'}
 LOG = logging.getLogger('review-agent')
 
 
@@ -47,16 +50,21 @@ class Config:
     space: str
     activated_at: str
     self_user: str = SELF_USER
-    poll_seconds: int = 5
+    poll_seconds: int = 2
     actor: str = 'justinlee1253'
     context_repositories: tuple = REPOS
+    reactions: dict = field(default_factory=lambda: dict(REACTIONS))
 
     def __post_init__(self):
         if not re.fullmatch(r'spaces/[A-Za-z0-9_-]+', self.space):
             raise ConfigError('An exact Google Chat space resource is required.')
         timestamp(self.activated_at)
-        if self.poll_seconds != 5 or self.actor != 'justinlee1253' or self.self_user != SELF_USER:
-            raise ConfigError('This pilot uses the agreed five-second interval and Justin identities.')
+        if self.poll_seconds != 2 or self.actor != 'justinlee1253' or self.self_user != SELF_USER:
+            raise ConfigError('This pilot uses the agreed two-second interval and Justin identities.')
+        if (not isinstance(self.reactions, dict) or set(self.reactions) != set(REACTIONS)
+                or any(not isinstance(v, str) or not v.strip() or len(v) > 16
+                       or any(ord(c) < 32 for c in v) for v in self.reactions.values())):
+            raise ConfigError('Configure one Unicode emoji for each of picked_up, approved, changes_requested, warning.')
         if not set(self.context_repositories).issubset(REPOS):
             raise ConfigError('Only ROKT/launch-engineering is currently enabled for reviews and context.')
 
@@ -76,7 +84,7 @@ class ChatBlocked(Exception):
     """No more Chat requests until an explicit health check succeeds."""
 
 
-def pr_links(text):
+def pr_candidates(text):
     found = set()
     for token in re.findall(r'https?://[^\s<>"\x00-\x1f]+', text or ''):
         try:
@@ -86,16 +94,20 @@ def pr_links(text):
             match = re.fullmatch(r'/([^/]+)/([^/]+)/pull/([1-9][0-9]*)(?:/(?:files|changes|commits))?/?', url.path)
             if not match:
                 continue
-            repo = next((r for r in REPOS if r.lower() == '/'.join(match.group(1, 2)).lower()), None)
-            if repo:
-                found.add((repo, int(match[3])))
+            found.add(('/'.join(match.group(1, 2)), int(match[3])))
         except ValueError:
             continue
     return sorted(found)
 
 
+def pr_links(text):
+    return sorted({(repo, number) for candidate, number in pr_candidates(text)
+                   for repo in REPOS if repo.casefold() == candidate.casefold()})
+
+
 class Store:
-    def __init__(self, path=RUNTIME / 'state.sqlite3'):
+    def __init__(self, path=RUNTIME / 'state.sqlite3', reactions=None):
+        self.reactions = dict(reactions or REACTIONS)
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path.parent.chmod(0o700)
@@ -126,7 +138,23 @@ class Store:
             create table if not exists events(
                 id integer primary key, at text not null, job text,
                 code text not null, unique_key text unique);
+            create table if not exists model_runs(
+                id text primary key, job text, started_at text, finished_at text,
+                model text, effort text, service_tier text, status text,
+                input_tokens integer, cached_input_tokens integer,
+                output_tokens integer, reasoning_output_tokens integer,
+                estimated_credits real, pricing text);
         ''')
+        columns = {row['name'] for row in self.db.execute('pragma table_info(jobs)')}
+        for name, definition in {'requested_at': 'text', 'ready_after': 'real not null default 0',
+                                 'mode': "text not null default 'review'", 'requester': 'text',
+                                 'head_moves': 'integer not null default 0'}.items():
+            if name not in columns:
+                self.db.execute('alter table jobs add column ' + name + ' ' + definition)
+        self.db.execute('update jobs set requested_at=coalesce((select min(created_at) from sources where sources.job=jobs.id), updated_at) where requested_at is null')
+        self.db.execute('create index if not exists jobs_ready on jobs(status,ready_after,requested_at)')
+        self.db.execute('create index if not exists source_pr on sources(repo,number,created_at)')
+        self.db.commit()
 
     def meta(self, key):
         row = self.db.execute('select value from metadata where key=?', (key,)).fetchone()
@@ -151,9 +179,56 @@ class Store:
         self.db.execute('insert or ignore into outbox(id,kind,target,payload) values(?,?,?,?)',
                         (id, kind, target, json.dumps(payload)))
 
+    def _reaction(self, message, emoji):
+        self._outbox('reaction:' + message + ':' + emoji, 'reaction', message, {'emoji': {'unicode': emoji}})
+
+    def start_model_run(self, job):
+        id = str(uuid.uuid4())
+        with self.db:
+            self.db.execute('insert into model_runs(id,job,started_at,model,effort,service_tier,status,pricing) values(?,?,?,?,?,?,?,?)',
+                (id, job, utc(), usage.MODEL, usage.EFFORT, usage.SERVICE_TIER, 'running', json.dumps(usage.PRICING)))
+        return id
+
+    def end_model_run(self, id, status, tokens):
+        tokens = tokens if usage.valid_usage(tokens) else {}
+        with self.db:
+            self.db.execute('update model_runs set finished_at=?,status=?,input_tokens=?,cached_input_tokens=?,output_tokens=?,reasoning_output_tokens=?,estimated_credits=? where id=?',
+                (utc(), status, tokens.get('input_tokens'), tokens.get('cached_input_tokens'), tokens.get('output_tokens'),
+                 tokens.get('reasoning_output_tokens'), usage.estimate_credits(tokens), id))
+
+    def costs(self):
+        rows = [dict(row) for row in self.db.execute('select model_runs.*,jobs.repo,jobs.number from model_runs left join jobs on jobs.id=model_runs.job order by started_at')]
+        by_pr = {}
+        for row in rows:
+            row['pricing'] = json.loads(row['pricing'])
+            key = f"{row['repo']}#{row['number']}" if row['repo'] else 'configuration_checks'
+            total = by_pr.setdefault(key, {'runs': 0, 'known_estimated_credits': 0, 'unknown_usage_runs': 0})
+            total['runs'] += 1
+            total['known_estimated_credits'] = round(total['known_estimated_credits'] + (row['estimated_credits'] or 0), 8)
+            total['unknown_usage_runs'] += row['estimated_credits'] is None
+        return {'known_estimated_credits': round(sum(row['estimated_credits'] or 0 for row in rows), 8),
+                'unknown_usage_runs': sum(row['estimated_credits'] is None for row in rows),
+                'actual_usd': None, 'billing_note': usage.PRICING['basis'], 'by_pr': by_pr, 'runs': rows}
+
+    def first_request(self, job):
+        return self.db.execute('select * from sources where repo=? and number=? order by created_at,rowid limit 1',
+                               (job['repo'], job['number'])).fetchone()
+
+    def stamp_authorized(self, sender):
+        email = sender.get('email')
+        if email:
+            if email.casefold() == STAMP_EMAIL and re.fullmatch(r'users/[0-9]+', sender.get('name', '')):
+                self._meta('stamp_identity', {'user': sender['name'], 'email': STAMP_EMAIL, 'verified_at': utc()})
+                return True
+            if (self.meta('stamp_identity') or {}).get('user') == sender.get('name'):
+                self._meta('stamp_identity', None)
+            return False
+        binding = self.meta('stamp_identity') or {}
+        return binding.get('email') == STAMP_EMAIL and binding.get('user') == sender.get('name')
+
     def ingest(self, config, messages, start, end, token):
         with self.db:
-            for msg in messages:
+            for msg in sorted((m for m in messages if isinstance(m, dict)), key=lambda m: str(m.get('createTime', ''))):
                 name = msg.get('name', '')
                 thread = msg.get('thread', {}).get('name', '')
                 sender = msg.get('sender', {})
@@ -169,24 +244,49 @@ class Store:
                         or not re.fullmatch(r'users/[A-Za-z0-9_-]+', sender.get('name', ''))
                         or msg.get('deleteTime') or not in_window):
                     continue
-                for repo, number in pr_links(msg.get('text', '')):
+                text = msg.get('text', '')
+                links = pr_links(text)
+                unsupported = [repo for repo, _ in pr_candidates(text) if repo.casefold() not in {r.casefold() for r in REPOS}]
+                if unsupported:
+                    self._outbox('scope:' + name, 'message', thread, {'text': 'Review held — this pilot supports only ROKT/launch-engineering (including Orbit). Other repository links were not queued.', 'thread': {'name': thread}})
+                    self._reaction(name, config.reactions['warning'])
+                is_mani = self.stamp_authorized(sender)
+                wants_stamp = bool(re.search(r'\bSTAMP\b', text, re.IGNORECASE))
+                mode = 'stamp' if wants_stamp else 'review'
+                if wants_stamp:
+                    command = re.sub(r'https?://[^\s<>"\x00-\x1f]+', '', text).strip(' \n\r\t:;,<>').casefold()
+                    if not is_mani or command not in {'stamp', 'stamp for mani'} or not links:
+                        reason = ('STAMP is reserved for verified mani.vedma@rokt.com. Post without STAMP for a Falcon review.' if not is_mani
+                                  else 'Use an actual GitHub PR link followed by STAMP. A folder link does not identify a PR.')
+                        self._outbox('stamp_help:' + name, 'message', thread, {'text': reason, 'thread': {'name': thread}})
+                        self._reaction(name, config.reactions['warning'])
+                        continue
+                for repo, number in links:
                     if self.db.execute('select 1 from sources where message=? and repo=? and number=?',
                                        (name, repo, number)).fetchone():
                         continue
-                    job = self.db.execute("select id from jobs where repo=? and number=? and status in ('queued','reviewing','submitting','ambiguous') order by updated_at limit 1",
+                    first = self.first_request({'repo': repo, 'number': number})
+                    job = self.db.execute("select * from jobs where repo=? and number=? and status in ('queued','reviewing','waiting_ci','submitting','ambiguous') order by requested_at limit 1",
                                           (repo, number)).fetchone()
                     if job:
                         id = job['id']
+                        if job['status'] == 'waiting_ci':
+                            self.db.execute('update jobs set ready_after=0 where id=?', (id,))
                     else:
                         id = str(uuid.uuid4())
-                        self.db.execute('insert into jobs(id,repo,number,status,updated_at) values(?,?,?,?,?)',
-                                        (id, repo, number, 'queued', utc()))
+                        self.db.execute('insert into jobs(id,repo,number,status,updated_at,requested_at,mode,requester) values(?,?,?,?,?,?,?,?)',
+                                        (id, repo, number, 'queued', utc(), utc(created), mode, sender['name']))
                         self.event('queued', id)
                     self.db.execute('insert into sources values(?,?,?,?,?,?)',
                                     (name, repo, number, thread, msg['createTime'], id))
+                    acknowledgment = 'Received — queued for ' + ('Mani STAMP approval without code review.' if mode == 'stamp' else 'Falcon review.')
+                    if first:
+                        acknowledgment = f"Already requested at {first['created_at']}. " + (
+                            'Following the original request; no second review is queued.' if job else
+                            'Checking for a new commit; the same head will reuse the original result without model tokens.')
                     self._outbox('ack:' + name, 'message', thread,
-                                 {'text': 'Received — queued for Falcon review.', 'thread': {'name': thread}})
-                    self._outbox('eyes:' + name, 'reaction', name, {'emoji': {'unicode': '👀'}})
+                                 {'text': acknowledgment, 'thread': {'name': thread}})
+                    self._reaction(name, config.reactions['picked_up'])
             self._meta('scan', {'start': start, 'end': end, 'token': token} if token else None)
             if not token:
                 self._meta('checkpoint', end)
@@ -196,13 +296,13 @@ class Store:
 
     def claim(self):
         with self.db:
-            row = self.db.execute("select * from jobs where status in ('submitting','ambiguous','queued') order by case when status='queued' then 1 else 0 end,updated_at limit 1").fetchone()
-            if row and row['status'] == 'queued':
+            row = self.db.execute("select * from jobs where status in ('submitting','ambiguous','queued','waiting_ci') and ready_after<=? order by case when status in ('submitting','ambiguous') then 0 else 1 end,requested_at,rowid limit 1", (time.time(),)).fetchone()
+            if row and row['status'] in {'queued', 'waiting_ci'}:
                 self.db.execute("update jobs set status='reviewing',updated_at=? where id=?", (utc(), row['id']))
             return dict(row) if row else None
 
     def update(self, job, **values):
-        allowed = {'status', 'head', 'base', 'payload', 'marker', 'review_id', 'review_url', 'result'}
+        allowed = {'status', 'head', 'base', 'payload', 'marker', 'review_id', 'review_url', 'result', 'ready_after', 'head_moves'}
         if not set(values).issubset(allowed):
             raise ValueError('Invalid job update')
         values['updated_at'] = utc()
@@ -211,16 +311,17 @@ class Store:
                             (*values.values(), job['id']))
         job.update(values)
 
-    def finish(self, job, status, text, emoji=None):
+    def finish(self, job, status, text, reaction='warning'):
+        emoji = self.reactions[reaction]
         with self.db:
             self.db.execute('update jobs set status=?,result=?,updated_at=? where id=?', (status, text, utc(), job['id']))
-            self.event(status, job['id'])
+            self.event(status, job['id'], unique=job['id'] + ':' + status + ':' + hashlib.sha256(text.encode()).hexdigest())
             for source in self.db.execute('select * from sources where job=?', (job['id'],)).fetchall():
                 key = job['id'] + ':' + hashlib.sha256(text.encode()).hexdigest() + ':' + source['thread']
                 self._outbox('result:' + key, 'message', source['thread'],
                              {'text': text, 'thread': {'name': source['thread']}})
-                if emoji:
-                    self._outbox('verdict:' + key + ':' + source['message'], 'reaction', source['message'], {'emoji': {'unicode': emoji}})
+                self._reaction(source['message'], emoji)
+        job.update(status=status, result=text)
 
     def reviewed(self, repo, number, head, actor):
         row = self.db.execute('select * from ledger where repo=? and number=? and head=? and actor=?',
@@ -236,6 +337,10 @@ class Store:
 
     def recover(self):
         with self.db:
+            interrupted = self.db.execute("select distinct jobs.* from jobs join model_runs on model_runs.job=jobs.id where jobs.status='reviewing' and model_runs.status='running'").fetchall()
+            for row in interrupted:
+                self.finish(dict(row), 'needs-attention', f"{row['repo']}#{row['number']} — Review held: model run was interrupted; usage may be unreported. Inspect costs before explicitly retrying.")
+            self.db.execute("update model_runs set status='interrupted',finished_at=? where status='running'", (utc(),))
             self.db.execute("update jobs set status='queued' where status='reviewing'")
             # A reserved write is reconciled, never blindly repeated after a crash.
             self.db.execute("update jobs set status='ambiguous' where status='submitting'")
@@ -331,7 +436,9 @@ def flush_outbox(store, chat, now=None):
     if store.meta('chat_blocked'):
         return
     now = time.time() if now is None else now
-    rows = store.db.execute("select * from outbox where status='pending' and next_at<=? order by case when kind='message' then 0 else 1 end,rowid limit 8", (now,)).fetchall()
+    # One message and up to five reactions per second stay within per-space write quotas.
+    rows = store.db.execute("select * from outbox where status='pending' and next_at<=? and kind='message' order by rowid limit 1", (now,)).fetchall()
+    rows += store.db.execute("select * from outbox where status='pending' and next_at<=? and kind='reaction' order by rowid limit 5", (now,)).fetchall()
     for row in rows:
         try:
             result = chat.send(row)
@@ -369,7 +476,7 @@ def run(config, directory=RUNTIME):
     directory = Path(directory)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with process_lock(directory / 'worker.lock'):
-        store = Store(directory / 'state.sqlite3')
+        store = Store(directory / 'state.sqlite3', config.reactions)
         store.import_previous()
         store.recover()
         stop = threading.Event()
@@ -382,7 +489,7 @@ def run(config, directory=RUNTIME):
         LOG.setLevel(logging.INFO)
 
         def review_loop():
-            work = Store(directory / 'state.sqlite3')
+            work = Store(directory / 'state.sqlite3', config.reactions)
             while not stop.is_set():
                 job = work.claim()
                 if not job:
@@ -441,6 +548,7 @@ def main():
     commands.add_parser('run')
     commands.add_parser('status')
     commands.add_parser('history')
+    commands.add_parser('costs', help='Per-PR token usage and reference credit estimates; never an invoice')
     retry = commands.add_parser('retry', help='Explicitly retry a paused job; reserved writes are reconciled only')
     retry.add_argument('job_id')
     check = commands.add_parser('check-chat', help='Explicit read-only health check; never opens a browser')
@@ -467,19 +575,26 @@ def main():
         if args.command == 'run':
             run(config)
             return 0
-        store = Store()
-        if args.command == 'history':
+        store = Store(reactions=config.reactions)
+        if args.command == 'costs':
+            print(json.dumps(store.costs(), indent=2))
+        elif args.command == 'history':
             print(json.dumps({'jobs': store.history(),
                 'reviews': [dict(r) for r in store.db.execute('select * from ledger')],
                 'events': [dict(r) for r in store.db.execute('select * from events order by id desc limit 100')]}, indent=2))
         elif args.command == 'retry':
-            row = store.db.execute("select * from jobs where id=? and status='needs-attention'", (args.job_id,)).fetchone()
+            row = store.db.execute("select * from jobs where id=? and status in ('needs-attention','deferred')", (args.job_id,)).fetchone()
             if not row:
-                raise ConfigError('Only a needs-attention job may be explicitly retried.')
-            store.update(dict(row), status='ambiguous' if row['payload'] else 'queued')
+                raise ConfigError('Only a held job may be explicitly retried.')
+            if row['mode'] == 'stamp' and not row['payload']:
+                raise ConfigError('Ask Mani to post a fresh STAMP request for the current head.')
+            store.update(dict(row), status='ambiguous' if row['payload'] else 'queued', ready_after=0, head_moves=0)
             print('Queued for reconciliation only.' if row['payload'] else 'Queued for a fresh review.')
         elif args.command == 'status':
-            print(json.dumps({'space': config.space, 'checkpoint': store.meta('checkpoint'),
+            print(json.dumps({'space': config.space, 'poll_seconds': config.poll_seconds, 'worker_count': 1,
+                'reactions': config.reactions,
+                'model': {'name': usage.MODEL, 'reasoning_effort': usage.EFFORT, 'service_tier': usage.SERVICE_TIER},
+                'checkpoint': store.meta('checkpoint'),
                 'scan': store.meta('scan'), 'chat_blocked': store.meta('chat_blocked'),
                 'heartbeat': store.meta('heartbeat'), 'google_auth': CredentialManager().status(),
                 'jobs': [dict(r) for r in store.db.execute('select status,count(*) as count from jobs group by status')],

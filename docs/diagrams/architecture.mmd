@@ -1,0 +1,18 @@
+flowchart LR
+    chat["Google Chat API<br/>Dedicated review space"]
+    subgraph mac["Local macOS runtime"]
+        listener["Python listener<br/>Polling and thread delivery"]
+        queue[("SQLite<br/>Queue, outbox, review ledger")]
+        worker["Python review worker<br/>One PR at a time"]
+        keychain["macOS Keychain<br/>Google OAuth grant"]
+        policy["Falcon skill<br/>Review policy and repository guidance"]
+    end
+    codex["Codex CLI → remote model<br/>Source evidence / structured JSON"]
+    github["GitHub REST API via gh<br/>PR, source, CI status, reviews"]
+    listener -->|Poll / thread replies| chat
+    listener -->|Durable intake| queue
+    queue -->|Claim next PR| worker
+    keychain -->|OAuth grant| listener
+    policy -->|Review criteria| worker
+    worker -->|Evidence / JSON| codex
+    worker -->|Read / publish| github

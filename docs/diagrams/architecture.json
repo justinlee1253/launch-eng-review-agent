@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Launch Engineering Review Agent",
+    "quality_profile": "showcase",
+    "locale": "en",
+    "repository": {
+      "url": "https://github.com/justinlee1253/launch-eng-review-agent",
+      "revision": "bc4159a14e794358dc3f050651ccfc960a3c9d82",
+      "provider": "github",
+      "link_mode": "local-only"
+    }
+  },
+  "components": [
+    {
+      "id": "chat",
+      "type": "external",
+      "label": "Google Chat",
+      "sublabel": "Dedicated review space",
+      "pos": [
+        55,
+        100
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "agent.py",
+          "line": 251,
+          "label": "Implementation"
+        }
+      ]
+    },
+    {
+      "id": "listener",
+      "type": "backend",
+      "label": "Python listener",
+      "sublabel": "Poll, acknowledge, deliver replies",
+      "pos": [
+        460,
+        100
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "agent.py",
+          "line": 367,
+          "label": "Implementation"
+        }
+      ]
+    },
+    {
+      "id": "queue",
+      "type": "database",
+      "label": "SQLite state",
+      "sublabel": "FIFO queue, outbox, review ledger",
+      "pos": [
+        865,
+        100
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "agent.py",
+          "line": 97,
+          "label": "Implementation"
+        }
+      ]
+    },
+    {
+      "id": "keychain",
+      "type": "security",
+      "label": "macOS Keychain",
+      "sublabel": "Google grant + silent renewal",
+      "pos": [
+        55,
+        380
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "auth.py",
+          "line": 67,
+          "label": "Implementation"
+        }
+      ]
+    },
+    {
+      "id": "policy",
+      "type": "security",
+      "label": "Review policy",
+      "sublabel": "Falcon skill + repository guidance",
+      "pos": [
+        460,
+        380
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "review.py",
+          "line": 403,
+          "label": "Implementation"
+        }
+      ]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "Python review worker",
+      "sublabel": "One PR at a time; guarded writes",
+      "pos": [
+        865,
+        380
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "review.py",
+          "line": 497,
+          "label": "Implementation"
+        }
+      ]
+    },
+    {
+      "id": "codex",
+      "type": "cloud",
+      "label": "Codex model",
+      "sublabel": "CLI sends evidence; returns JSON",
+      "pos": [
+        460,
+        660
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "review.py",
+          "line": 328,
+          "label": "Implementation"
+        }
+      ]
+    },
+    {
+      "id": "github",
+      "type": "external",
+      "label": "GitHub REST API",
+      "sublabel": "PR, source, CI status, reviews",
+      "pos": [
+        865,
+        660
+      ],
+      "size": [
+        245,
+        90
+      ],
+      "sources": [
+        {
+          "path": "review.py",
+          "line": 61,
+          "label": "Implementation"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "chat-api",
+      "from": "listener",
+      "to": "chat",
+      "label": "Poll / thread replies"
+    },
+    {
+      "id": "intake",
+      "from": "listener",
+      "to": "queue",
+      "label": "Durable intake"
+    },
+    {
+      "id": "claim",
+      "from": "queue",
+      "to": "worker",
+      "label": "Claim next PR",
+      "labelDy": 24
+    },
+    {
+      "id": "grant",
+      "from": "keychain",
+      "to": "listener",
+      "label": "OAuth grant",
+      "variant": "security"
+    },
+    {
+      "id": "criteria",
+      "from": "policy",
+      "to": "worker",
+      "label": "Review criteria",
+      "variant": "security"
+    },
+    {
+      "id": "analysis",
+      "from": "worker",
+      "to": "codex",
+      "label": "Evidence / JSON"
+    },
+    {
+      "id": "rest",
+      "from": "worker",
+      "to": "github",
+      "label": "Read / publish",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Evidence",
+      "items": [
+        "8 of 8 components verified against launch-eng-review-agent@bc4159a. All relationships are verified and drawn solid.",
+        "Source citations are pinned to the inspected commit. This component map is not a live deployment acceptance record."
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Runtime boundary",
+      "items": [
+        "Listener, SQLite, worker, policy files and Keychain run on one Mac. Codex model inference and Google/GitHub APIs are remote.",
+        "The worker persists outcomes to the outbox; the listener delivers original-thread replies and reactions."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Publishing boundary",
+      "items": [
+        "The model receives source evidence and returns structured findings. Python validates completeness, head SHA, identity and duplicate state before publishing.",
+        "CI status is read from GitHub; the agent does not execute repository builds or tests."
+      ]
+    }
+  ]
+}

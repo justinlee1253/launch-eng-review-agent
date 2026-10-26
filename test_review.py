@@ -58,6 +58,9 @@ class GitHub:
     def comments(self, repo, number):
         return []
 
+    def ci(self, repo, head):
+        return {'state': 'passed', 'checks': ['buildkite/pipeline']}
+
     def capture(self, job, pr):
         return snapshot()
 
@@ -119,6 +122,8 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(payload['comments'][0]['line'], 1)
         self.assertEqual(payload['comments'][0]['side'], 'RIGHT')
         self.assertIn('**Blocking:**', payload['comments'][0]['body'])
+        reactions = [json.loads(row[0])['emoji']['unicode'] for row in self.store.db.execute("select payload from outbox where kind='reaction'")]
+        self.assertEqual(reactions, ['👀', '💬'])
 
     def test_incomplete_missing_lens_and_missing_file_cannot_approve(self):
         for output in [result(status='incomplete'), result(lenses=['security']), result(reviewed_files=[])]:

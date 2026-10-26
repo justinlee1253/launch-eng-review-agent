@@ -122,9 +122,12 @@ assert '--ignore-user-config' in args and '--ephemeral' in args
 assert 'features.shell_tool=false' in args and 'features.apps=false' in args
 assert 'agents.enabled=false' in args and 'features.plugins=false' in args
 assert args[args.index('--sandbox')+1] == 'read-only'
+assert args[args.index('--model')+1] == 'gpt-6.1-sol'
+assert 'model_reasoning_effort="xhigh"' in args and 'service_tier="fast"' in args
 sys.stdin.read()
 pathlib.Path(args[args.index('--output-last-message')+1]).write_text(json.dumps({"status":"incomplete","summary":"isolated"}))
 print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":"result"}}))
+print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":200,"reasoning_output_tokens":150}}))
 ''')
         executable.chmod(0o700)
         reviewer = Reviewer(self.tmp.name)
