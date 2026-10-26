@@ -1,0 +1,144 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "reviewed_head",
+    "reviewed_files",
+    "lenses",
+    "requests",
+    "findings"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "needs_evidence",
+        "complete",
+        "incomplete"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "reviewed_head": {
+      "type": "string"
+    },
+    "reviewed_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lenses": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "correctness",
+          "security",
+          "operability"
+        ]
+      }
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "repo",
+          "ref",
+          "kind",
+          "path"
+        ],
+        "properties": {
+          "repo": {
+            "type": "string",
+            "enum": [
+              "ROKT/launch-engineering"
+            ]
+          },
+          "ref": {
+            "type": "string",
+            "enum": [
+              "head",
+              "base",
+              "main"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "tree"
+            ]
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "blocking",
+          "severity",
+          "path",
+          "side",
+          "line",
+          "title",
+          "scenario",
+          "impact",
+          "evidence",
+          "fix"
+        ],
+        "properties": {
+          "blocking": {
+            "type": "boolean"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "dangerous",
+              "should_fix"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "RIGHT",
+              "LEFT"
+            ]
+          },
+          "line": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "scenario": {
+            "type": "string"
+          },
+          "impact": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "fix": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
