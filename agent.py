@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from auth import AuthRequired, ConfigError, CredentialManager, TemporaryAuthError
+from auth import AuthRequired, ConfigError, CredentialManager, TemporaryAuthError, can_update_reactions
 import usage
 
 
@@ -185,7 +185,17 @@ class Store:
                         (id, kind, target, json.dumps(payload)))
 
     def _reaction(self, message, emoji):
-        self._outbox('reaction:' + message + ':' + emoji, 'reaction', message, {'emoji': {'unicode': emoji}})
+        id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'reaction:' + message))
+        managed = set(self.reactions.values()) | {emoji}
+        for row in self.db.execute("select payload from outbox where kind='reaction' and target=?", (message,)):
+            old = json.loads(row['payload'])
+            managed.update(old.get('managed_emojis', []))
+            managed.add(old['emoji']['unicode'])
+        payload = json.dumps({'emoji': {'unicode': emoji}, 'managed_emojis': sorted(managed)})
+        self.db.execute("update outbox set status='superseded' where kind='reaction' and target=? and id<>?", (message, id))
+        self.db.execute("""insert into outbox(id,kind,target,payload) values(?,'reaction',?,?)
+            on conflict(id) do update set payload=excluded.payload,status='pending',attempts=0,next_at=0,sent_at=null
+            where outbox.payload<>excluded.payload""", (id, message, payload))
 
     def start_model_run(self, job):
         id = str(uuid.uuid4())
@@ -383,6 +393,20 @@ class Store:
             self.db.execute("update jobs set status='queued' where status='reviewing'")
             # A reserved write is reconciled, never blindly repeated after a crash.
             self.db.execute("update jobs set status='ambiguous' where status='submitting'")
+            if not self.meta('single_status_reactions'):
+                latest = {row['target']: json.loads(row['payload'])['emoji']['unicode'] for row in
+                          self.db.execute("select target,payload from outbox where kind='reaction' and status<>'superseded' order by rowid")}
+                for message, emoji in latest.items():
+                    job = self.db.execute('''select jobs.status,jobs.payload from jobs join sources on sources.job=jobs.id
+                        where sources.message=? order by jobs.updated_at desc limit 1''', (message,)).fetchone()
+                    if job and job['status'] in {'queued', 'reviewing', 'submitting', 'ambiguous'}:
+                        emoji = self.reactions['picked_up']
+                    elif job and job['status'] in {'needs-attention', 'deferred', 'waiting_ci'}:
+                        emoji = self.reactions['warning']
+                    elif job and job['status'] == 'submitted' and job['payload']:
+                        emoji = self.reactions['approved' if json.loads(job['payload'])['event'] == 'APPROVE' else 'changes_requested']
+                    self._reaction(message, emoji)
+                self._meta('single_status_reactions', True)
 
     def import_previous(self):
         with self.db:
@@ -400,8 +424,10 @@ class Chat:
         self.session = requests.Session()
 
     def request(self, method, resource, **kwargs):
-        if not (resource == self.config.space + '/messages'
-                or re.fullmatch(re.escape(self.config.space) + r'/messages/[A-Za-z0-9_.-]+/reactions', resource)):
+        reaction = re.escape(self.config.space) + r'/messages/[A-Za-z0-9_.-]+/reactions'
+        if not ((resource == self.config.space + '/messages' and method in {'GET', 'POST'})
+                or (re.fullmatch(reaction, resource) and method in {'GET', 'POST'})
+                or (re.fullmatch(reaction + r'/[A-Za-z0-9_.-]+', resource) and method == 'DELETE')):
             raise ConfigError('Chat access is restricted to the configured space.')
         for attempt in range(2):
             if not self.credentials or not self.credentials.valid or attempt:
@@ -422,6 +448,8 @@ class Chat:
             if response.status_code in (401, 403):
                 raise ChatBlocked('chat_access_denied_' + str(response.status_code))
             if response.status_code == 409 and resource.endswith('/reactions'):
+                return {}
+            if method == 'DELETE' and response.status_code in (200, 204, 404):
                 return {}
             if response.status_code == 429 or response.status_code >= 500:
                 raise TemporaryFailure('chat_service_' + str(response.status_code))
@@ -447,7 +475,37 @@ class Chat:
                 raise ConfigError('Reply must use its original configured-space thread.')
             return self.request('POST', self.config.space + '/messages', json=payload,
                 params={'requestId': row['id'], 'messageReplyOption': 'REPLY_MESSAGE_OR_FAIL'})
-        return self.request('POST', row['target'] + '/reactions', json=payload)
+        return self.sync_reaction(row['target'], payload)
+
+    def sync_reaction(self, message, payload):
+        resource = message + '/reactions'
+        desired = payload['emoji']['unicode']
+        managed = set(payload.get('managed_emojis', self.config.reactions.values())) | {desired}
+        statuses, token = [], None
+        for _ in range(3):
+            params = {'pageSize': 200, 'filter': 'user.name = "' + self.config.self_user + '"'}
+            if token:
+                params['pageToken'] = token
+            page = self.request('GET', resource, params=params)
+            for reaction in page.get('reactions', []):
+                if reaction.get('user', {}).get('name') != self.config.self_user or reaction.get('emoji', {}).get('unicode') not in managed:
+                    continue
+                if not re.fullmatch(re.escape(resource) + r'/[A-Za-z0-9_.-]+', reaction.get('name', '')):
+                    raise ConfigError('Reaction resource does not belong to the requested message.')
+                statuses.append(reaction)
+            token = page.get('nextPageToken')
+            if not token:
+                break
+        if token:
+            raise TemporaryFailure('reaction_list_incomplete')
+        obsolete = [r for r in statuses if r['emoji']['unicode'] != desired]
+        if obsolete and not can_update_reactions(self.credentials):
+            raise ConfigError('Replacing status requires the explicit reaction-permission upgrade; no browser was opened.')
+        # Delete first so a transition never deliberately displays two agent statuses.
+        for reaction in obsolete:
+            self.request('DELETE', reaction['name'])
+        current = next((r for r in statuses if r['emoji']['unicode'] == desired), None)
+        return current or self.request('POST', resource, json={'emoji': {'unicode': desired}})
 
 
 def scan_once(config, store, chat, cutoff=None):
@@ -482,18 +540,18 @@ def flush_outbox(store, chat, now=None):
         try:
             result = chat.send(row)
             with store.db:
-                store.db.execute("update outbox set status='sent',sent_at=?,response_name=? where id=?",
-                                 (utc(), result.get('name'), row['id']))
+                store.db.execute("update outbox set status='sent',sent_at=?,response_name=? where id=? and payload=?",
+                                 (utc(), result.get('name'), row['id'], row['payload']))
         except ChatBlocked as error:
             store.block_chat(str(error))
             return
         except TemporaryFailure:
             with store.db:
-                store.db.execute('update outbox set attempts=attempts+1,next_at=? where id=?',
-                    (now + min(300, 5 * 2 ** min(row['attempts'], 6)), row['id']))
+                store.db.execute('update outbox set attempts=attempts+1,next_at=? where id=? and payload=?',
+                    (now + min(300, 5 * 2 ** min(row['attempts'], 6)), row['id'], row['payload']))
         except ConfigError:
             with store.db:
-                store.db.execute("update outbox set status='needs-attention' where id=?", (row['id'],))
+                store.db.execute("update outbox set status='needs-attention' where id=? and payload=?", (row['id'], row['payload']))
                 store.event('chat_delivery_needs_attention', unique='delivery:' + row['id'])
 
 

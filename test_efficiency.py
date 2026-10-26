@@ -168,7 +168,7 @@ class EfficiencyTests(unittest.TestCase):
         self.store.finish(job, 'submitted', 'Approved', 'approved')
         self.store.finish(job, 'submitted', 'Approved', 'approved')
         reactions = [json.loads(row['payload'])['emoji']['unicode'] for row in self.store.db.execute("select * from outbox where kind='reaction'")]
-        self.assertEqual(reactions, ['👀', '🎉'])
+        self.assertEqual(reactions, ['🎉'])
         replies = self.store.db.execute("select * from outbox where kind='message'").fetchall()
         self.assertTrue(all(json.loads(row['payload'])['thread']['name'] == message()['thread']['name'] for row in replies))
 
@@ -177,7 +177,7 @@ class EfficiencyTests(unittest.TestCase):
         self.github.data.update(merged=True, state='closed')
         review.review_one(self.config, self.store, self.github, NoModel(), job)
         reactions = [json.loads(row[0])['emoji']['unicode'] for row in self.store.db.execute("select payload from outbox where kind='reaction'")]
-        self.assertEqual(reactions, ['👀', '⚠️'])
+        self.assertEqual(reactions, ['⚠️'])
         self.assertIn('PR is merged', self.store.history()[0]['result'])
 
     def test_out_of_scope_pr_gets_warning_without_queue_or_model(self):
@@ -200,7 +200,7 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(self.store.history()[0]['status'], 'submitted')
         self.assertIn('PR is now closed', self.store.history()[0]['result'])
         reactions = [json.loads(row[0])['emoji']['unicode'] for row in self.store.db.execute("select payload from outbox where kind='reaction'")]
-        self.assertEqual(reactions, ['👀', '⚠️'])
+        self.assertEqual(reactions, ['⚠️'])
 
     def test_head_change_cancels_running_model_and_records_unknown_usage(self):
         reviewer = review.Reviewer(Path(self.tmp.name))

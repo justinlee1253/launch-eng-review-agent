@@ -188,6 +188,41 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(observed['login_hint'], 'justin.lee@rokt.com')
         self.assertIsNotNone(store.value)
 
+    def test_reaction_upgrade_reuses_secure_client_and_verifies_refresh_before_replacing_grant(self):
+        scope = 'https://www.googleapis.com/auth/chat.messages.reactions'
+        upgraded = SCOPES[:2] + [scope]
+        endpoint = TokenEndpoint({'access_token': 'FAKE-new', 'expires_in': 3600,
+                                  'token_type': 'Bearer', 'scope': ' '.join(upgraded)})
+        store = MemoryStore(credentials(expired=False))
+        manager = self.manager(store, endpoint)
+        observed = {}
+        def factory(config, scopes, **kwargs):
+            observed['scopes'] = scopes
+            self.assertEqual(config['installed']['client_id'], 'FAKE-client.apps.googleusercontent.com')
+            class Flow:
+                def run_local_server(inner, **options):
+                    return credentials(scopes=upgraded, expired=False)
+            return Flow()
+        manager.authorize(None, reauthorize=True, reaction_updates=True, flow_factory=factory)
+        self.assertEqual(set(observed['scopes']), set(upgraded))
+        self.assertEqual(endpoint.calls, 1)
+        self.assertEqual(manager.status()['status'], 'ready')
+        self.assertTrue(self.auth.can_update_reactions(manager.load()))
+
+    def test_declined_reaction_upgrade_preserves_existing_healthy_grant(self):
+        store = MemoryStore(credentials(expired=False))
+        original = store.value
+        manager = self.manager(store)
+        def factory(*args, **kwargs):
+            class Flow:
+                def run_local_server(inner, **options):
+                    return credentials(expired=False)
+            return Flow()
+        with self.assertRaises(self.auth.AuthRequired):
+            manager.authorize(None, reauthorize=True, reaction_updates=True, flow_factory=factory)
+        self.assertEqual(store.value, original)
+        self.assertFalse(manager.status().get('blocked'))
+
     def test_setup_rejects_other_project_before_browser(self):
         path = self.client_file(project_id='unrelated-project')
         with self.assertRaises(self.auth.ConfigError):

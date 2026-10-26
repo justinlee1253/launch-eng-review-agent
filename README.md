@@ -19,7 +19,7 @@ https://github.com/ROKT/launch-engineering/pull/1234
 | 💬 | Changes requested | Explanation, GitHub review link, and commit SHA. |
 | ⚠️ | Review held or skipped | Reason and, where applicable, the next action. |
 
-Reactions are additive: 👀 remains as the receipt. The latest thread response explains the current state. Reposting the same reviewed commit reuses the existing result without another model review. A new commit can receive a fresh review.
+Every PR request message, including thread replies, has one current agent status. Status updates remove the agent's previous status before adding the new one; other people's reactions are preserved. Google exposes separate delete/create calls, so a transition can briefly show no status. Reposting the same reviewed commit reuses the existing result without another model review. A new commit can receive a fresh review.
 
 Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Everyone in the designated space, including the operator, can request a review. The agent ignores its own outgoing replies and bot messages; PRs authored by either configured operator GitHub identity remain excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
 
@@ -149,6 +149,20 @@ https://www.googleapis.com/auth/chat.messages.reactions.create
 ```
 
 An existing grant should be checked rather than authorized again. Revocation or policy changes can still invalidate authorization; the runtime pauses and records the failure rather than repeatedly prompting. Keep OAuth client files and grants out of Git, Chat messages, and logs.
+
+Replacing a status also requires `https://www.googleapis.com/auth/chat.messages.reactions`.
+The older create-only grant remains valid for reads and messages. After explicitly approving
+this new capability, upgrade once using the client already in Keychain:
+
+```bash
+.venv/bin/python auth.py authorize --reaction-updates
+```
+
+This command requests read/create-message access plus full reaction access, opens one Google
+consent window, verifies offline refresh, and only then replaces the saved grant. It does not
+need another client JSON download. A declined or failed upgrade retains the local prior grant.
+The listener never starts this command or opens a permission window on its own. Without delete
+permission, it records one delivery failure rather than adding a conflicting second status.
 
 ### Configure and start
 
