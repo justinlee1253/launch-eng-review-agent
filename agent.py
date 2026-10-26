@@ -267,11 +267,18 @@ class Store:
                 if (msg.get('space', {}).get('name', config.space) != config.space
                         or not re.fullmatch(re.escape(config.space) + r'/messages/[A-Za-z0-9_.-]+', name)
                         or not re.fullmatch(re.escape(config.space) + r'/threads/[A-Za-z0-9_.-]+', thread)
-                        or sender.get('type') != 'HUMAN' or sender.get('name') == config.self_user
+                        or sender.get('type') != 'HUMAN'
                         or not re.fullmatch(r'users/[A-Za-z0-9_-]+', sender.get('name', ''))
                         or msg.get('deleteTime') or not in_window):
                     continue
                 text = msg.get('text', '')
+                if sender.get('name') == config.self_user:
+                    replies = self.db.execute("select response_name,payload from outbox where kind='message' and target=?",
+                                              (thread,))
+                    # Match the saved payload too when Chat accepted a send but its response was lost.
+                    if any(row['response_name'] == name or json.loads(row['payload']).get('text') == text
+                           for row in replies):
+                        continue
                 links = pr_links(text)
                 unsupported = [repo for repo, _ in pr_candidates(text) if repo.casefold() not in {r.casefold() for r in REPOS}]
                 if unsupported:

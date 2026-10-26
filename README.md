@@ -21,7 +21,7 @@ https://github.com/ROKT/launch-engineering/pull/1234
 
 Reactions are additive: 👀 remains as the receipt. The latest thread response explains the current state. Reposting the same reviewed commit reuses the existing result without another model review. A new commit can receive a fresh review.
 
-Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Requests from the operator's own Chat identity, bot messages, and PRs authored by either configured operator GitHub identity are excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
+Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Everyone in the designated space, including the operator, can request a review. The agent ignores its own outgoing replies and bot messages; PRs authored by either configured operator GitHub identity remain excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
 
 ### STAMP exception
 
