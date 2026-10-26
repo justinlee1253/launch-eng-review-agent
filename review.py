@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 
-from agent import ConfigError, REPOS, ROOT, STAMP_EMAIL, Store
+from agent import ConfigError, REPOS, ROOT, Store
 import usage
 
 
@@ -626,7 +626,7 @@ def review_one(config, store, github, reviewer, job):
         if after:
             reason += f" The submitted review applies only to the old head: {old_url}."
         if job.get('mode') == 'stamp':
-            store.finish(job, 'deferred', reason + ' Mani must post a new STAMP request for the new head.')
+            store.finish(job, 'deferred', reason + ' An authorized sender must post a new STAMP request for the new head.')
         elif moves >= 3:
             hold('The head keeps changing. Post again when the PR is stable; no more automatic model retries.')
         else:
@@ -637,9 +637,9 @@ def review_one(config, store, github, reviewer, job):
         if job['repo'] not in REPOS:
             raise Incomplete('Repository is no longer in the pilot allowlist; no review was posted.')
         stamp = job.get('mode') == 'stamp'
-        binding = store.meta('stamp_identity') or {}
-        if stamp and (binding.get('email') != STAMP_EMAIL or binding.get('user') != job.get('requester')):
-            raise Incomplete('STAMP requester is not verified as Mani; no approval or model run is allowed.')
+        stamp_email = store.stamp_email(job.get('requester')) if stamp else None
+        if stamp and not stamp_email:
+            raise Incomplete('STAMP requester is not currently authorized; no approval or model run is allowed.')
         if github.actor() != config.actor:
             raise Incomplete('Authenticated GitHub account differs from justinlee1253; no account was switched.')
         if job['status'] in {'submitting', 'ambiguous'}:
@@ -685,7 +685,7 @@ def review_one(config, store, github, reviewer, job):
             raise WaitForCI('No changed files; no review is needed.')
         if stamp:
             payload = {'event': 'APPROVE', 'commit_id': job['head'], 'comments': [],
-                       'body': 'Stamped — approved as requested without code review.\n\nRequested by ' + STAMP_EMAIL
+                       'body': 'Stamped — approved as requested without code review.\n\nRequested by ' + stamp_email
                                + '\nPR head: ' + job['head'] + '\n\n' + marker(job['repo'], job['number'], job['head'], stamp=True)}
             output = {'summary': 'approved as requested without code review.'}
         else:
@@ -711,6 +711,8 @@ def review_one(config, store, github, reviewer, job):
         if moved(current):
             return
         require_ready(github, job, current)
+        if stamp and store.stamp_email(job.get('requester')) != stamp_email:
+            raise Incomplete('STAMP permission changed before submission; no approval was posted.')
         if getattr(reviewer, 'stop', None) and reviewer.stop.is_set():
             raise Incomplete('Worker stopped; no review was submitted.')
         store.update(job, status='submitting', payload=json.dumps(payload), marker=marker(job['repo'], job['number'], job['head'], stamp=stamp))
@@ -736,6 +738,6 @@ def review_one(config, store, github, reviewer, job):
         store.finish(job, 'waiting_ci' if error.retry else 'deferred', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\nReview held — {error}")
     except HeadMoved as error:
         moved(error.current)
-    except (Incomplete, GitHubError, FileNotFoundError, KeyError, TypeError, ValueError) as error:
-        reason = str(error) if isinstance(error, Incomplete) else type(error).__name__ + '; required GitHub evidence is unavailable.'
+    except (Incomplete, ConfigError, GitHubError, FileNotFoundError, KeyError, TypeError, ValueError) as error:
+        reason = str(error) if isinstance(error, (Incomplete, ConfigError)) else type(error).__name__ + '; required GitHub evidence is unavailable.'
         hold(reason)

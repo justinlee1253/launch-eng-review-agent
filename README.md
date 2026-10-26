@@ -37,6 +37,19 @@ STAMP submits an approval **without code review** and says so explicitly on GitH
 
 **The PR creator retains full ownership and responsibility for any stamped PR**, including its correctness, security, testing, and production impact. A STAMP approval does not transfer that responsibility to the agent or the person requesting the stamp.
 
+STAMP access is managed in the local `.runtime/stamp-permissions.json` file:
+
+```json
+{
+  "allowed_emails": [
+    "authorized.teammate@rokt.com",
+    "another.authorized.teammate@rokt.com"
+  ]
+}
+```
+
+Add or remove exact email addresses to grant or revoke access; matching is case-insensitive. The file is reloaded when checking a request and immediately before submitting an approval, so allowlist edits do not require a restart. Verified sender IDs are cached separately and never override the current allowlist. A missing or empty file grants nobody access; invalid JSON prevents stamping. Copy [stamp-permissions.example.json](stamp-permissions.example.json) to the local runtime directory for a new installation. The active allowlist is excluded from Git and is never read from PR or Chat content.
+
 ## Architecture
 
 ```mermaid
@@ -184,7 +197,7 @@ After repairing a Chat connection, verify and explicitly resume:
 .venv/bin/python agent.py check-chat --resume
 ```
 
-Only a genuinely invalid Google grant requires explicit repair with `auth.py authorize --client-file ... --reauthorize`, followed by renewal verification. After investigating a held review, an operator can use `agent.py retry JOB_ID`. Reserved writes receive reconciliation only. STAMP requests without a reserved write require a fresh request from Mani.
+Only a genuinely invalid Google grant requires explicit repair with `auth.py authorize --client-file ... --reauthorize`, followed by renewal verification. After investigating a held review, an operator can use `agent.py retry JOB_ID`. Reserved writes receive reconciliation only. STAMP requests without a reserved write require a fresh request from an authorized sender.
 
 ### Local data
 

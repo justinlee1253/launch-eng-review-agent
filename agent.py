@@ -29,7 +29,6 @@ ROOT = Path(__file__).resolve().parent
 RUNTIME = ROOT / '.runtime'
 REPOS = ('ROKT/launch-engineering',)
 SELF_USER = 'users/104386993234033491963'
-STAMP_EMAIL = 'mani.vedma@rokt.com'
 REACTIONS = {'picked_up': '👀', 'approved': '✅', 'changes_requested': '💬', 'warning': '⚠️'}
 LOG = logging.getLogger('review-agent')
 
@@ -154,6 +153,12 @@ class Store:
         self.db.execute('update jobs set requested_at=coalesce((select min(created_at) from sources where sources.job=jobs.id), updated_at) where requested_at is null')
         self.db.execute('create index if not exists jobs_ready on jobs(status,ready_after,requested_at)')
         self.db.execute('create index if not exists source_pr on sources(repo,number,created_at)')
+        legacy = self.meta('stamp_identity')
+        if legacy:
+            identities = self.meta('stamp_identities') or {}
+            identities.setdefault(legacy['user'], legacy)
+            self._meta('stamp_identities', identities)
+            self._meta('stamp_identity', None)
         self.db.commit()
 
     def meta(self, key):
@@ -214,17 +219,39 @@ class Store:
         return self.db.execute('select * from sources where repo=? and number=? order by created_at,rowid limit 1',
                                (job['repo'], job['number'])).fetchone()
 
+    def stamp_emails(self):
+        path = self.path.parent / 'stamp-permissions.json'
+        try:
+            value = json.loads(path.read_text())
+        except FileNotFoundError:
+            return set()
+        except (OSError, ValueError):
+            raise ConfigError('STAMP permissions JSON is unreadable or invalid; no stamp is authorized.') from None
+        if (not isinstance(value, dict) or set(value) != {'allowed_emails'}
+                or not isinstance(value['allowed_emails'], list)
+                or any(not isinstance(email, str) or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)
+                       for email in value['allowed_emails'])):
+            raise ConfigError('STAMP permissions must contain an allowed_emails array of exact email addresses.')
+        return {email.casefold() for email in value['allowed_emails']}
+
+    def stamp_email(self, user):
+        binding = (self.meta('stamp_identities') or {}).get(user, {})
+        email = binding.get('email')
+        return email if email in self.stamp_emails() else None
+
     def stamp_authorized(self, sender):
-        email = sender.get('email')
-        if email:
-            if email.casefold() == STAMP_EMAIL and re.fullmatch(r'users/[0-9]+', sender.get('name', '')):
-                self._meta('stamp_identity', {'user': sender['name'], 'email': STAMP_EMAIL, 'verified_at': utc()})
-                return True
-            if (self.meta('stamp_identity') or {}).get('user') == sender.get('name'):
-                self._meta('stamp_identity', None)
+        user, email = sender.get('name'), sender.get('email')
+        if not isinstance(user, str) or not re.fullmatch(r'users/[0-9]+', user):
             return False
-        binding = self.meta('stamp_identity') or {}
-        return binding.get('email') == STAMP_EMAIL and binding.get('user') == sender.get('name')
+        if email is not None:
+            identities = self.meta('stamp_identities') or {}
+            identities.pop(user, None)
+            allowed = isinstance(email, str) and email.casefold() in self.stamp_emails()
+            if allowed:
+                identities[user] = {'email': email.casefold(), 'verified_at': utc()}
+            self._meta('stamp_identities', identities)
+            return allowed
+        return self.stamp_email(user) is not None
 
     def ingest(self, config, messages, start, end, token):
         with self.db:
@@ -250,13 +277,18 @@ class Store:
                 if unsupported:
                     self._outbox('scope:' + name, 'message', thread, {'text': 'Review held — this pilot supports only ROKT/launch-engineering (including Orbit). Other repository links were not queued.', 'thread': {'name': thread}})
                     self._reaction(name, config.reactions['warning'])
-                is_mani = self.stamp_authorized(sender)
                 wants_stamp = bool(re.search(r'\bSTAMP\b', text, re.IGNORECASE))
                 mode = 'stamp' if wants_stamp else 'review'
                 if wants_stamp:
+                    try:
+                        authorized = self.stamp_authorized(sender)
+                    except ConfigError as error:
+                        self._outbox('stamp_config:' + name, 'message', thread, {'text': str(error), 'thread': {'name': thread}})
+                        self._reaction(name, config.reactions['warning'])
+                        continue
                     command = re.sub(r'https?://[^\s<>"\x00-\x1f]+', '', text).strip(' \n\r\t:;,<>').casefold()
-                    if not is_mani or command not in {'stamp', 'stamp for mani'} or not links:
-                        reason = ('STAMP is reserved for verified mani.vedma@rokt.com. Post without STAMP for a Falcon review.' if not is_mani
+                    if not authorized or command not in {'stamp', 'stamp for mani'} or not links:
+                        reason = ('STAMP requires explicit permission. Contact Justin Lee (justin.lee@rokt.com) for access, or post without STAMP for a Falcon review.' if not authorized
                                   else 'Use an actual GitHub PR link followed by STAMP. A folder link does not identify a PR.')
                         self._outbox('stamp_help:' + name, 'message', thread, {'text': reason, 'thread': {'name': thread}})
                         self._reaction(name, config.reactions['warning'])
@@ -279,7 +311,7 @@ class Store:
                         self.event('queued', id)
                     self.db.execute('insert into sources values(?,?,?,?,?,?)',
                                     (name, repo, number, thread, msg['createTime'], id))
-                    acknowledgment = 'Received — queued for ' + ('Mani STAMP approval without code review.' if mode == 'stamp' else 'Falcon review.')
+                    acknowledgment = 'Received — queued for ' + ('STAMP approval without code review.' if mode == 'stamp' else 'Falcon review.')
                     if first:
                         acknowledgment = f"Already requested at {first['created_at']}. " + (
                             'Following the original request; no second review is queued.' if job else
@@ -587,7 +619,7 @@ def main():
             if not row:
                 raise ConfigError('Only a held job may be explicitly retried.')
             if row['mode'] == 'stamp' and not row['payload']:
-                raise ConfigError('Ask Mani to post a fresh STAMP request for the current head.')
+                raise ConfigError('An authorized sender must post a fresh STAMP request for the current head.')
             store.update(dict(row), status='ambiguous' if row['payload'] else 'queued', ready_after=0, head_moves=0)
             print('Queued for reconciliation only.' if row['payload'] else 'Queued for a fresh review.')
         elif args.command == 'status':

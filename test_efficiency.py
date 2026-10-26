@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from agent import Config, REACTIONS, Store, flush_outbox
+from agent import Config, ConfigError, REACTIONS, Store, flush_outbox
 from test_agent import SPACE, START, END, message
 from test_review import GitHub, HEAD
 import review
@@ -23,6 +23,8 @@ class EfficiencyTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = Store(Path(self.tmp.name) / 'state.sqlite3')
+        self.permissions = Path(self.tmp.name) / 'stamp-permissions.json'
+        self.permissions.write_text(json.dumps({'allowed_emails': ['mani.vedma@rokt.com']}))
         self.addCleanup(self.store.db.close)
         self.config = Config(SPACE, START)
         self.github = GitHub()
@@ -114,6 +116,40 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(self.store.history()[0]['status'], 'deferred')
         self.assertIsNone(self.store.claim())
         self.assertEqual(len(self.github.submitted), 1)
+
+    def test_json_allowlist_supports_multiple_verified_users_and_cached_ids(self):
+        self.permissions.write_text(json.dumps({'allowed_emails': ['first@rokt.com', 'second@rokt.com']}))
+        for user, email in [('users/111', 'FIRST@rokt.com'), ('users/222', 'second@rokt.com')]:
+            with self.store.db:
+                self.assertTrue(self.store.stamp_authorized({'name': user, 'email': email}))
+                self.assertTrue(self.store.stamp_authorized({'name': user}))
+        self.permissions.write_text(json.dumps({'allowed_emails': ['second@rokt.com']}))
+        self.assertIsNone(self.store.stamp_email('users/111'))
+        self.assertEqual(self.store.stamp_email('users/222'), 'second@rokt.com')
+
+    def test_revoking_permission_before_submission_blocks_a_queued_stamp(self):
+        job = self.enqueue(message(text='https://github.com/ROKT/launch-engineering/pull/6000 STAMP',
+            sender={'name': 'users/123456789', 'email': 'mani.vedma@rokt.com', 'type': 'HUMAN'}))
+        original = self.github.ci
+        calls = []
+        def revoke(*args):
+            calls.append(1)
+            if len(calls) == 2:
+                self.permissions.write_text('{"allowed_emails": []}')
+            return original(*args)
+        self.github.ci = revoke
+        review.review_one(self.config, self.store, self.github, NoModel(), job)
+        self.assertEqual(self.github.submitted, [])
+        self.assertEqual(self.store.history()[0]['status'], 'needs-attention')
+
+    def test_missing_or_malformed_allowlist_never_grants_stamp_permission(self):
+        self.permissions.unlink()
+        sender = {'name': 'users/111', 'email': 'mani.vedma@rokt.com'}
+        self.assertFalse(self.store.stamp_authorized(sender))
+        for value in ('bad json', '{"allowed_emails": "*@rokt.com"}', '{"allowed_emails": [null]}'):
+            self.permissions.write_text(value)
+            with self.assertRaises(ConfigError):
+                self.store.stamp_authorized(sender)
 
     def test_interrupted_model_run_is_not_automatically_repeated_on_restart(self):
         job = self.enqueue()
