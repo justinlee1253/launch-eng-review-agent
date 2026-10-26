@@ -64,7 +64,12 @@ def read_local(evidence, path, kind, *, sections=None):
     if key not in evidence.local_documents:
         if path.is_symlink():
             raise ValueError('Context symlinks are not permitted.')
-        raw = path.read_text()
+        try:
+            raw = path.read_text()
+        except OSError:
+            evidence.documents['local-context:' + key] = None
+            evidence.check_budget()
+            return
         if len(raw) > 250_000:
             raise ValueError('Local context exceeds the review limit.')
         evidence.local_documents[key] = raw
@@ -101,7 +106,7 @@ def load(evidence, github, affected):
 
 
 def topic(evidence, path):
-    if evidence.repo != REPOSITORY or not evidence.references.get('orbit') or path not in TOPICS:
+    if evidence.repo != REPOSITORY or (evidence.scope or {}).get('profile') != 'orbit' or path not in TOPICS:
         raise ValueError('Only listed Orbit topic pages may be requested for an Orbit review.')
     read_local(evidence, VAULT / path, 'wiki_summary')
 
@@ -116,7 +121,8 @@ def audit(directory, evidence):
             'main': evidence.context_refs.get(evidence.repo + ':main'), 'scope': evidence.scope,
             'profiles': sorted(evidence.references), 'sources': evidence.provenance,
             'context_refs': evidence.context_refs, 'dependencies': evidence.dependencies,
-            'documents': sorted(evidence.documents)}
+            'documents': sorted(evidence.documents),
+            'unavailable_documents': sorted(key for key, value in evidence.documents.items() if value is None)}
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as output:

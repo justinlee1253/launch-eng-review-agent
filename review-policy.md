@@ -57,6 +57,19 @@ list immediate children, so use them to discover callers/tests/config rather tha
 paths or ask for the entire company. Approved context repos are ROKT/launch-engineering only. If a necessary other service is inaccessible, return
 status=incomplete and explain what is missing. Do not approve an incomplete review.
 
+Use best-effort review with the available evidence. Additional file/tree/topic requests
+are context probes, not declarations that every requested document is indispensable.
+A documents value of null means a repository path is absent at the recorded SHA, or a
+local background source could not be read. Do not repeat that same request or treat
+absence alone as a PR defect. Continue with available acceptance criteria, source, callers and tests;
+discover an alternative path only to resolve a concrete review question. A linked plan
+can explain intent without being required to assess the implementation. Complete the
+review when material questions are resolved, noting any relevant limitation. Return
+incomplete only when you can name a consequential unanswered question and explain why
+the available evidence cannot resolve it. Never invent missing requirements or silently
+substitute main/proposed behavior for the captured PR. Missing changed-file source,
+corrupt/truncated source and failed required access checks still prevent a complete review.
+
 The host supplies applicable review references as actual text. Apply the Orbit reference
 only when present. review_scope explains selection, including old paths on moves/deletions
 and changed explicit Orbit directory references in shared infrastructure. For other services,

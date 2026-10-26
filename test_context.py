@@ -11,7 +11,7 @@ from unittest.mock import patch
 import review
 from agent import Config
 from test_agent import SPACE, START
-from test_review import BASE, HEAD, PR
+from test_review import BASE, HEAD, PR, result
 
 
 MAIN = 'd' * 40
@@ -107,6 +107,28 @@ class ContextTests(unittest.TestCase):
         remote, evidence = self.capture()
         self.assertIn('orbit-reference-marker', self.prompt(remote, evidence))
 
+    def test_missing_background_reaches_next_round_without_forcing_a_verdict(self):
+        for status in ('complete', 'incomplete'):
+            with self.subTest(status=status):
+                remote, evidence = self.capture()
+                reviewer = review.Reviewer(self.root)
+                prompts = []
+                def invoke(prompt, **kwargs):
+                    prompts.append(prompt)
+                    if len(prompts) == 1:
+                        return {'status': 'needs_evidence', 'requests': [
+                            {'repo': evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'Orbit/docs/missing-plan.md'}]}
+                    self.assertIn('ROKT/launch-engineering@' + HEAD + ':Orbit/docs/missing-plan.md": null', prompt)
+                    return result(status=status, reviewed_files=evidence.files)
+                reviewer.invoke = invoke
+                output = reviewer.review(remote, evidence)
+                self.assertEqual(len(prompts), 2)
+                if status == 'complete':
+                    self.assertEqual(review.review_payload({'repo': evidence.repo, 'number': 6000}, evidence, output)['event'], 'APPROVE')
+                else:
+                    with self.assertRaises(review.Incomplete):
+                        review.review_payload({'repo': evidence.repo, 'number': 6000}, evidence, output)
+
     def test_unrelated_service_receives_no_orbit_local_context(self):
         _, evidence = self.capture(path='sibling/handler.py')
         self.assertEqual(evidence.instructions, {})
@@ -160,10 +182,15 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(data['dependencies']['ROKT/launch-engineering#42']['status'], 'proposed')
         self.assertEqual(data['dependencies']['ROKT/launch-engineering#42']['head'], 'e' * 40)
 
-    def test_missing_orbit_guide_holds_orbit_but_not_other_services(self):
+    def test_missing_orbit_background_is_reported_without_blocking_source_review(self):
         self.reference.unlink()
-        with self.assertRaises(review.Incomplete):
-            self.capture()
+        (self.vault / 'wiki/orbit-open-questions.md').unlink()
+        remote, evidence = self.capture()
+        self.assertIn('new', evidence.diff)
+        self.assertIsNone(evidence.documents['local-context:' + str(self.reference)])
+        self.assertIsNone(evidence.documents['local-context:' + str(self.vault / 'wiki/orbit-open-questions.md')])
+        evidence.fulfill(remote, [{'repo': evidence.repo, 'ref': 'head', 'kind': 'context', 'path': 'wiki/orbit-agent-workflow.md'}])
+        self.assertIsNone(evidence.documents['local-context:' + str(self.vault / 'wiki/orbit-agent-workflow.md')])
         _, other = self.capture(path='sibling/handler.py')
         self.assertIsNone(other.scope)
 

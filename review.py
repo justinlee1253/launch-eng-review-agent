@@ -317,8 +317,7 @@ class GitHub:
                 raise Incomplete('Required Orbit review reference or local context is unavailable.') from None
             for path in ('Orbit/CLAUDE.md', 'Orbit/tasks/lessons.md'):
                 if evidence.read(self, repo, head, path, optional=True) is None:
-                    if evidence.read(self, repo, ancestor, path, optional=True) is None:
-                        raise Incomplete('Required Orbit instructions are unavailable at head and merge base: ' + path)
+                    evidence.read(self, repo, ancestor, path, optional=True)
             optional = {'Orbit/AGENTS.md'}
             if any('web/' in path or '/docs/product/' in path for path in affected):
                 optional.update({'Orbit/docs/product/context.md', 'Orbit/docs/design/orbit-ui-ds/project/README.md'})
@@ -384,6 +383,8 @@ class Evidence:
         key = repo + '@' + check_sha(sha) + ':' + safe_path(path)
         if key not in self.documents:
             self.documents[key] = github.file(repo, sha, path, optional=optional)
+        if self.documents[key] is None and not optional:
+            raise Incomplete('Required file is inaccessible: ' + repo + ':' + path)
         self.check_budget()
         return self.documents[key]
 
@@ -421,9 +422,14 @@ class Evidence:
                 raise Incomplete('Only captured refs, approved main, or an explicitly requested PR may be read.')
             path = safe_path(request['path'], root=request['kind'] == 'tree')
             if request['kind'] == 'file':
-                self.read(github, repo, sha, path)
+                self.read(github, repo, sha, path, optional=True)
             elif request['kind'] == 'tree':
-                self.documents[repo + '@' + sha + ':' + path + '/DIRECTORY'] = github.tree(repo, sha, path)
+                key = repo + '@' + sha + ':' + path + '/DIRECTORY'
+                if key not in self.documents:
+                    try:
+                        self.documents[key] = github.tree(repo, sha, path)
+                    except FileNotFoundError:
+                        self.documents[key] = None
             else:
                 raise Incomplete('Only file and directory evidence reads are permitted.')
         self.check_budget()
