@@ -100,6 +100,26 @@ The review inputs are:
 
 The configured model is GPT-6.1 Sol with Fast service and `xhigh` reasoning. Settings and reference credit rates live in [usage.py](usage.py). All review lenses run sequentially.
 
+Orbit guidance is selected only for changes under `Orbit/` (including previous paths on
+renames and removed files), or changed configuration/command lines in shared infrastructure
+that explicitly reference `Orbit/`. Unrelated services receive no Orbit vault context.
+The host embeds the existing Falcon Orbit reference as text; it does not fork or modify
+the skill. Repository rules remain anchored to the PR's captured commits.
+
+Orbit reviews receive the vault entry points, status/open questions, and relevant sections
+of the architecture page. Source changes may also load the connector README; UI changes
+load available product/design guidance. The model can request specific additional repository
+files or a page from the fixed local topic allowlist. Missing required context holds the
+review. Local summaries record their compiled SHA against pinned main and remain discovery
+context, not proof that a proposal is merged or deployed.
+
+A necessary companion PR can be read with `ref=pr/NUMBER`; its head is pinned and its
+merged/proposed/closed state is explicit. A changed dependency prevents publishing a verdict
+based on obsolete evidence. The repository allowlist and publishing permissions stay the same.
+`.runtime/context/` retains an atomic audit per job/head with inspected document paths,
+SHAs, local content hashes and selected guidance. It contains no source-document bodies or
+incoming Chat messages.
+
 ## Setup
 
 ### Install dependencies

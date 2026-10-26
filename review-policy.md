@@ -48,10 +48,34 @@ Aurelia 1.x, NLog and the documented SQL conventions, not Nancy UI's React/TypeS
 Use status=needs_evidence with a small batch of precise file/tree requests when needed.
 For the reviewed repo, ref=head is the captured PR head, ref=base is its merge base.
 For approved related services, ref=main is resolved once to a full SHA and stays pinned.
+For a specific linked dependency PR in the approved repository, ref=pr/NUMBER reads its
+captured head. Request it only when a concrete contract or acceptance question requires
+it. Dependencies reports distinguish proposed, closed-unmerged and merged PRs; none proves
+deployment. Do not attribute a dependency's changes to the target PR.
 Use repository-relative paths, no URLs, wildcards, traversal or commands. Tree requests
 list immediate children, so use them to discover callers/tests/config rather than guess
 paths or ask for the entire company. Approved context repos are ROKT/launch-engineering only. If a necessary other service is inaccessible, return
 status=incomplete and explain what is missing. Do not approve an incomplete review.
+
+The host supplies applicable review references as actual text. Apply the Orbit reference
+only when present. review_scope explains selection, including old paths on moves/deletions
+and changed explicit Orbit directory references in shared infrastructure. For other services,
+do not apply Orbit-specific rules. Repository decisions and acceptance criteria at the
+captured refs outrank local summaries; summarize the intended outcome before assessing it.
+Use the PR's linked plan/criteria and precise repository file requests to resolve intent.
+If decisive criteria live outside available sources, name that gap rather than invent them.
+
+context_provenance records each local source's content hash and any compiled SHA compared
+with pinned main. different_from_main means verify the relevant claims in captured source;
+it does not prove every statement is obsolete or that a deployment exists. Local wiki notes
+and open PRs are discovery evidence, not newly approved requirements. A local AGENTS file
+does not establish that the same file is committed. Preserve documented cache-write and
+other exceptions; report consequences, not keyword matches or architectural taste.
+
+For an Orbit review, request another listed local page with kind=context, repo equal to
+the reviewed repo, ref=head, and path equal to a review_scope.topic_requests entry. The
+host reads only that fixed allowlist. Do not request absolute paths or arbitrary local
+files. Ask for additional pages only to answer a specific review question.
 
 Return status=complete only after inspecting every changed file and completing
 correctness, security, and operability lenses. reviewed_head must exactly equal the full

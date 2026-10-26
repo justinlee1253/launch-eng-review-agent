@@ -27,9 +27,6 @@ class Remote(GitHub):
         self.mode = '100644'
         self.file_count = 1
 
-    def local_context(self, repo):
-        return {}
-
     def api(self, endpoint, payload=None):
         self.calls.append(endpoint)
         if '/compare/' in endpoint:
