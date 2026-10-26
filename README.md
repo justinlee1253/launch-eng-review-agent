@@ -25,7 +25,7 @@ Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are subm
 
 ### STAMP exception
 
-Only users with explicit STAMP permission may request an approval without code review. Contact Justin Lee at [justin.lee@rokt.com](mailto:justin.lee@rokt.com) to request access. Permission is checked against the sender's verified Google Chat identity; the current implementation authorizes `mani.vedma@rokt.com`.
+Only users with explicit STAMP permission may request an approval without code review. Contact Justin Lee at [justin.lee@rokt.com](mailto:justin.lee@rokt.com) to request access. Permission is checked against the sender's verified Google Chat identity.
 
 Authorized users can request:
 
