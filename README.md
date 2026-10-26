@@ -87,17 +87,7 @@ The review inputs are:
 
 The configured model is GPT-6.1 Sol with Fast service and `xhigh` reasoning. Settings and reference credit rates live in [usage.py](usage.py). All review lenses run sequentially.
 
-## Operator setup
-
-### Prerequisites
-
-- macOS with Python 3.10 or later and an available login Keychain.
-- GitHub CLI (`gh`) authenticated as the configured review account, with repository access and permission to submit reviews.
-- Codex CLI (`codex`) authenticated and able to use the configured model and service tier.
-- A Google Cloud Desktop OAuth client for the configured project, Google Chat API enabled, and access to the dedicated space.
-- The Falcon skill and local repository context files required by `GitHub.local_context()` in [review.py](review.py). Missing context holds the review.
-
-This implementation contains deployment-specific identities and project settings in [auth.py](auth.py) and [agent.py](agent.py). Adapt those deliberately when deploying for a different operator. Repository access is restricted by an explicit allowlist; related-service context outside it is unavailable until enabled.
+## Setup
 
 ### Install dependencies
 
