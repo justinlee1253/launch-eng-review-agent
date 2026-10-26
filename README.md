@@ -25,13 +25,17 @@ Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are subm
 
 ### STAMP exception
 
-Only the Google Chat identity verified as `mani.vedma@rokt.com` may request:
+Only users with explicit STAMP permission may request an approval without code review. Contact Justin Lee at [justin.lee@rokt.com](mailto:justin.lee@rokt.com) to request access. Permission is checked against the sender's verified Google Chat identity; the current implementation authorizes `mani.vedma@rokt.com`.
+
+Authorized users can request:
 
 ```text
 https://github.com/ROKT/launch-engineering/pull/1234 STAMP
 ```
 
 STAMP submits an approval **without code review** and says so explicitly on GitHub and in the Chat thread. It never merges. The sender must be verified from Google-provided identity fields; a name or email pasted into a message cannot authorize this action. Repository, PR state, CI, duplicate, account, and current-head checks still apply. A moved head requires a new explicit STAMP request. Repository folder URLs cannot identify a PR.
+
+**The PR creator retains full ownership and responsibility for any stamped PR**, including its correctness, security, testing, and production impact. A STAMP approval does not transfer that responsibility to the agent or the person requesting the stamp.
 
 ## Architecture
 
