@@ -88,6 +88,10 @@ The interactive diagram is a standalone HTML file; download it and open it in a 
 
 The model cannot publish directly. Shell, browser, plugins, MCP connections, hooks, and agent tools are disabled in the review subprocess. Python owns all validated evidence reads and external writes. Google Chat uses the REST API directly; GitHub REST requests use `gh api`. Neither Chat MCP nor GitHub MCP is required by this runtime.
 
+Each review attempt has one **20-minute overall budget**, starting when the worker begins the PR. Preflight, evidence capture, every model round, citation correction, and checks before publication share the same deadline. A model call can use all remaining time; it has no separate ten-minute cutoff. Citation correction still has its own two-minute maximum within that remaining time. Queue waiting and deferred CI waiting do not consume an attempt's budget.
+
+After expiry, the request is held and no new review write starts. Any completed draft remains available. A GitHub write already attempted is still reconciled and recorded, even after the deadline, so an uncertain result cannot cause a duplicate write. Chat delivery remains in the durable outbox. Shutdown reports `Worker stopped`; model timeouts have separate diagnostics and a `timed_out` usage status.
+
 ## Review policy
 
 Reviews prioritize material correctness bugs, vulnerabilities, broken contracts, data loss, reliability failures, and consequential design flaws. Formatting preferences, naming tastes, speculative rewrites, and missing tests alone do not block a merge. A complete review with no material blockers approves; substantiated blockers request changes.

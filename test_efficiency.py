@@ -239,7 +239,11 @@ class EfficiencyTests(unittest.TestCase):
         child = Mock(returncode=-15)
         child.poll.return_value = None
         guard = Mock(side_effect=[None, review.HeadMoved({'head': {'sha': 'c' * 40}})])
-        with patch('review.subprocess.Popen', return_value=child), patch('review.time.monotonic', side_effect=[0, 0, 20, 20]):
+        clock = [0]
+        def sleep(_):
+            clock[0] += 20
+        with patch('review.subprocess.Popen', return_value=child), \
+             patch('review.time.monotonic', side_effect=lambda: clock[0]), patch('review.time.sleep', side_effect=sleep):
             with self.assertRaises(review.HeadMoved):
                 reviewer.invoke('fixed test prompt', guard=guard)
         child.terminate.assert_called_once()
