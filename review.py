@@ -51,6 +51,15 @@ def ci_summary(statuses, checks):
     latest = {}
     for row in sorted(statuses, key=lambda r: (r.get('created_at', ''), r.get('id', 0))):
         latest[row['context']] = row
+    advisory = [{'name': row['context'], 'state': row['state'], 'url': row.get('target_url')}
+                for row in latest.values() if row['context'].strip().casefold() == 'claude code review']
+    latest = {name: row for name, row in latest.items() if name.strip().casefold() != 'claude code review'}
+    for row in checks:
+        if row['name'].strip().casefold() == 'claude code review':
+            advisory.append({'name': row['name'],
+                'state': row.get('conclusion') if row.get('status') == 'completed' else row.get('status'),
+                'url': row.get('html_url')})
+    checks = [row for row in checks if row['name'].strip().casefold() != 'claude code review']
     states = [row['state'] for row in latest.values()]
     conclusions = [row.get('conclusion') for row in checks if row.get('status') == 'completed']
     failed = any(s in {'failure', 'error'} for s in states) or any(c not in {'success', 'neutral', 'skipped'} for c in conclusions)
@@ -66,7 +75,8 @@ def ci_summary(statuses, checks):
         if state not in {'success', 'neutral', 'skipped'}:
             issues.append({'name': row['name'], 'state': state, 'url': row.get('html_url')})
     return {'state': 'failed' if failed else 'pending' if pending else 'passed' if states or checks else 'none',
-            'checks': sorted(set(latest) | {row['name'] for row in checks}), 'issues': issues}
+            'checks': sorted(set(latest) | {row['name'] for row in checks}), 'issues': issues,
+            'advisory_checks': advisory}
 
 
 def require_ready(github, job, pr):
