@@ -197,6 +197,15 @@ class Store:
             on conflict(id) do update set payload=excluded.payload,status='pending',attempts=0,next_at=0,sent_at=null
             where outbox.payload<>excluded.payload""", (id, message, payload))
 
+    def _pr_reaction(self, job, emoji):
+        for source in self.db.execute('select distinct message from sources where repo=? and number=?',
+                                      (job['repo'], job['number'])).fetchall():
+            self._reaction(source['message'], emoji)
+
+    def processing(self, job):
+        with self.db:
+            self._pr_reaction(job, self.reactions['picked_up'])
+
     def start_model_run(self, job):
         id = str(uuid.uuid4())
         with self.db:
@@ -369,7 +378,7 @@ class Store:
                 key = job['id'] + ':' + hashlib.sha256(text.encode()).hexdigest() + ':' + source['thread']
                 self._outbox('result:' + key, 'message', source['thread'],
                              {'text': text, 'thread': {'name': source['thread']}})
-                self._reaction(source['message'], emoji)
+            self._pr_reaction(job, emoji)
         job.update(status=status, result=text)
 
     def reviewed(self, repo, number, head, actor):
