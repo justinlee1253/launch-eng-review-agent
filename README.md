@@ -83,7 +83,7 @@ The interactive diagram is a standalone HTML file; download it and open it in a 
 2. **Schedule.** A SQLite queue selects requests in original posting order. One worker processes a PR at a time; the listener continues receiving requests. Reposts attach to active work instead of creating another review.
 3. **Check eligibility.** The worker verifies the GitHub account, PR state, existing reviews, and CI status before spending model tokens. Pending CI waits; failed CI, drafts, merged/closed PRs, and conflicts produce a held result.
 4. **Collect evidence.** GitHub REST reads retrieve complete text changes and relevant files at captured commit SHAs. The worker includes repository instructions, local architecture context, Falcon criteria, and the review policy. Additional evidence requests are restricted to approved files and directories.
-5. **Review.** The Codex subprocess returns structured findings or requests for more evidence. Absent supplemental files/directories are reported back to the reviewer so it can continue or explain a material evidence gap. The host validates completeness and file/line references. Missing changed-file source or genuinely required context cannot produce an approval.
+5. **Review.** The Codex subprocess returns structured findings or requests for more evidence. Absent supplemental files/directories are reported back to the reviewer so it can continue or explain a material evidence gap. The host saves the original draft and captured evidence before validating completeness and file/line references. A unique exact quotation can correct its own line number; other citation mismatches get at most one citation-only model pass, bounded to two minutes. Corrections cannot remove findings or change their meaning, blocking labels, or severity. Remaining mismatches hold the review with the exact finding, path, side, and line. Missing changed-file source or genuinely required context cannot produce an approval.
 6. **Publish.** The host rechecks account, head, PR state, CI, and intervening manual decisions, then reserves and submits one commit-anchored GitHub review. It queues the verdict and reaction for delivery to the original Chat thread.
 
 The model cannot publish directly. Shell, browser, plugins, MCP connections, hooks, and agent tools are disabled in the review subprocess. Python owns all validated evidence reads and external writes. Google Chat uses the REST API directly; GitHub REST requests use `gh api`. Neither Chat MCP nor GitHub MCP is required by this runtime.
@@ -233,9 +233,13 @@ After repairing a Chat connection, verify and explicitly resume:
 
 Only a genuinely invalid Google grant requires explicit repair with `auth.py authorize --client-file ... --reauthorize`, followed by renewal verification. After investigating a held review, an operator can use `agent.py retry JOB_ID`. Reserved writes receive reconciliation only. STAMP requests without a reserved write require a fresh request from an authorized sender.
 
+Retries and reposts at the same head/base reuse a retained completed draft, including its consumed correction budget, across restarts. A new head/base requires fresh evidence and analysis. Account, CI, dependency, manual-review, and duplicate checks still apply. Resuming a review restores 👀 on all tracked messages for that PR; the final status replaces it.
+
 ### Local data
 
 `.runtime/state.sqlite3` stores queue state, message resource IDs/timestamps/threads, outgoing replies, review intents, usage, and the review ledger. Incoming message bodies are not retained. `.runtime/payloads/` contains outgoing GitHub review payloads. `.runtime/activity.log` rotates at 1 MB with three backups. The runtime directory is owner-only; credentials remain in Keychain or the respective CLI's authentication storage.
+
+`.runtime/drafts/` stores private JSON snapshots with the original draft, current corrected draft, captured source, exact citation errors, and correction history. Files are written atomically with owner-only permissions and excluded from Git. These snapshots can contain private repository code; retain them with the same care as the source checkout. A corrupt snapshot holds the request instead of silently spending tokens on another full review.
 
 Preserve the SQLite database and its WAL files together when backing up. Deleting state can lose pending work and deduplication history. A failed Chat delivery does not repeat a successful GitHub review.
 

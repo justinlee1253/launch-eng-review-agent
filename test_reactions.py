@@ -40,6 +40,19 @@ class ReactionTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(json.loads(row['payload'])['emoji']['unicode'], '✅')
 
+    def test_resumed_review_replaces_old_parent_and_reply_warnings_with_eyes(self):
+        self.store.ingest(self.config, [message('parent')], START, END, None)
+        old = self.store.claim()
+        self.store.finish(old, 'needs-attention', 'Draft PR')
+        self.store.ingest(self.config, [message('reply')], START, END, None)
+        resumed = self.store.claim()
+        self.store.processing(resumed)
+        rows = self.store.db.execute("select payload from outbox where kind='reaction' and status<>'superseded'").fetchall()
+        self.assertEqual([json.loads(r[0])['emoji']['unicode'] for r in rows], ['👀', '👀'])
+        self.store.finish(resumed, 'submitted', 'Clean', 'approved')
+        rows = self.store.db.execute("select payload from outbox where kind='reaction' and status<>'superseded'").fetchall()
+        self.assertEqual([json.loads(r[0])['emoji']['unicode'] for r in rows], ['✅', '✅'])
+
     def test_startup_converts_legacy_reactions_to_the_latest_job_status(self):
         self.store.ingest(self.config, [message()], START, END, None)
         with self.store.db:
