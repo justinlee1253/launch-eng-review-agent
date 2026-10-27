@@ -155,7 +155,7 @@ Only `ROKT/launch-engineering` can be read; there is no other repository. Every 
 
 `kind: file` reads one file; `kind: tree` lists the immediate children of one folder. Paths are repository-relative, with no trailing slash. A request with one of these shapes stops the review with no verdict, even when the path exists: a path with `..`, a `.` segment, a leading `/`, `?`, `#`, `%` or a backslash; a `file` request on a directory, a symlink, a submodule, a binary file or a file over 250 KB; a `context` path outside the list. When you do not know whether a path is a file, request its parent `tree` first. An absent path returns `null`; that is safe. Do not request it again, and absence alone is not a defect. Ask for the evidence before you assume that absent context proves a bug.
 
-An `incomplete` review posts nothing on GitHub, and the host does not keep its `summary`. When the gap does not change the verdict, return `complete` with a non-blocking question on the nearest changed line. Return `incomplete` only when a missing file or fact could change the verdict; missing or truncated changed-file source, or a failed required read, is always incomplete.
+An `incomplete` review posts nothing on GitHub; its draft is retained privately for diagnosis. When the gap does not change the verdict, return `complete` with a non-blocking question on the nearest changed line. Return `incomplete` only when a missing file or fact could change the verdict; missing or truncated changed-file source, or a failed required read, is always incomplete.
 
 ## 12. The words the author reads
 
@@ -194,7 +194,7 @@ A non-blocking question, as the author sees it. The line is invented; the exampl
 > Evidence: `timedelta(days=TEAM["window_business_days"])`
 > Fix / question: Question: is the calendar-day window in `close_week` a copy of `open_week` on purpose? If yes, no change in this PR; add this line to the open question so one fix closes both. If no, the business-day arithmetic is its own brick; name it in the PR body.
 
-Before you return `complete`, every line below is true. The host checks the first group and rejects the whole review when one is false; the author then receives nothing.
+Before you return `complete`, every line below is true. The host checks the first group. It can correct a citation while retaining every finding and blocking decision; an unresolved mismatch holds the review with a specific diagnostic and no GitHub verdict.
 - `reviewed_head` is the full captured SHA. `reviewed_files` is exactly `changed_files`: nothing added, nothing missing; a file read for context is not listed. `lenses` is exactly `["correctness", "security", "operability"]`. `requests` is `[]`.
 - Every `dangerous` finding has `blocking: true`.
 - Every finding's `path` is a file the host captured at the cited side: `RIGHT` at head, `LEFT` at the merge base; a changed file, a captured instruction file, or a file you requested at `head` or `base`. A file read at `main` or `pr/N` cannot anchor a finding. For a removed file use `LEFT`; for a renamed file a `LEFT` finding uses the new path.
