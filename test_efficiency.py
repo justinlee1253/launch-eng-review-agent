@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from agent import Config, ConfigError, REACTIONS, Store, flush_outbox
 from test_agent import SPACE, START, END, message
-from test_review import GitHub, HEAD
+from test_review import GitHub, HEAD, Reviewer
 import review
 import usage
 
@@ -107,6 +107,38 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(review.ci_summary(statuses, [{'name': 'tests', 'status': 'in_progress', 'conclusion': None}])['state'], 'pending')
         self.assertEqual(review.ci_summary(statuses, [{'name': 'tests', 'status': 'completed', 'conclusion': 'cancelled'}])['state'], 'failed')
         self.assertEqual(review.ci_summary([], [])['state'], 'none')
+
+    def test_claude_code_review_is_advisory_in_every_state(self):
+        for status, conclusion in [('queued', None), ('in_progress', None),
+                                   ('completed', 'failure'), ('completed', 'cancelled'), ('completed', 'success')]:
+            with self.subTest(status=status, conclusion=conclusion):
+                row = {'name': 'Claude Code Review', 'status': status, 'conclusion': conclusion,
+                       'html_url': 'https://github.com/ROKT/launch-engineering/runs/123'}
+                ci = review.ci_summary([], [row])
+                self.assertEqual(ci['state'], 'none')
+                self.assertEqual(ci['checks'], [])
+                self.assertEqual(ci['advisory_checks'][0]['state'], conclusion if status == 'completed' else status)
+
+    def test_claude_status_does_not_hide_real_ci_failures_or_pending_tests(self):
+        statuses = [{'id': 1, 'context': 'Claude Code Review', 'state': 'failure'},
+                    {'id': 2, 'context': 'buildkite/pipeline', 'state': 'success'}]
+        self.assertEqual(review.ci_summary(statuses, [])['state'], 'passed')
+        for name, status, conclusion, expected in [
+            ('tests', 'in_progress', None, 'pending'),
+            ('pr-security-agent', 'completed', 'failure', 'failed'),
+            ('Claude Code Review integration tests', 'completed', 'failure', 'failed')]:
+            with self.subTest(name=name):
+                ci = review.ci_summary(statuses, [{'name': name, 'status': status, 'conclusion': conclusion}])
+                self.assertEqual(ci['state'], expected)
+
+    def test_claude_running_does_not_prevent_a_completed_falcon_review(self):
+        self.github.ci = lambda *args: review.ci_summary([], [
+            {'name': 'Claude Code Review', 'status': 'in_progress', 'conclusion': None}])
+        job = self.enqueue()
+        review.review_one(self.config, self.store, self.github, Reviewer(), job)
+        self.assertEqual(self.store.history()[0]['status'], 'submitted')
+        self.assertEqual(len(self.github.submitted), 1)
+        self.assertEqual(self.github.submitted[0]['event'], 'APPROVE')
 
     def test_stamp_head_change_requires_another_explicit_request(self):
         job = self.enqueue(message(text='https://github.com/ROKT/launch-engineering/pull/6000 STAMP',

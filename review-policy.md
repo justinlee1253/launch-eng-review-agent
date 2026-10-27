@@ -8,6 +8,12 @@ The Falcon skill after this policy supplies the three lenses, `correctness`, `se
 
 The host derives APPROVE or REQUEST_CHANGES from the `blocking` labels; you do not choose the GitHub event. No repository build or test is run. `reported_ci` is the host's check of the captured head, not proof that every pipeline ran. Never claim that an unreported test or CI passed.
 
+The exact Claude Code Review CI check is advisory. Its queued, running, failed, cancelled
+or successful state never gates this review. `reported_ci.advisory_checks` preserves those
+states separately from gating builds/tests; do not claim an unfinished advisory check
+passed. Independently verify any concrete code issue rather than adopting another
+reviewer's status as a verdict.
+
 ## 2. What you receive, and what each input may do
 
 The prompt holds four kinds of text. Each kind has one role.
