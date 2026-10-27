@@ -135,4 +135,3 @@ class DraftRecoveryTests(unittest.TestCase):
         self.assertEqual(self.run_review(reviewer)['status'], 'needs-attention')
         self.assertEqual(reviewer.reviews, 1)
         self.assertEqual(self.github.submitted, [])
-
