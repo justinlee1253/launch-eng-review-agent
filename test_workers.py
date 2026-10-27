@@ -72,6 +72,9 @@ class WorkerTests(unittest.TestCase):
                           lambda: self.store.reserve_submission(job, {}, 'wrong'),
                           lambda: self.store.record_review(job, 'justinlee1253', {'id':1,'html_url':'wrong','state':'APPROVED'})):
             with self.assertRaises(agent.ConfigError): operation()
+        unowned_snapshot = dict(job, owner=None)
+        with self.assertRaises(agent.ConfigError):
+            self.store.finish(unowned_snapshot, 'submitted', 'wrong', 'approved')
         self.assertEqual(self.store.history()[0]['owner'], 'two')
         self.assertEqual(self.store.history()[0]['status'], 'reviewing')
         self.assertIsNone(self.store.history()[0]['payload'])

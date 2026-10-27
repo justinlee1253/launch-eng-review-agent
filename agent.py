@@ -227,10 +227,9 @@ class Store:
             self._message_reaction(source['message'])
 
     def _require_owner(self, job):
-        if job.get('owner') is not None:
-            row = self.db.execute('select owner from jobs where id=?', (job['id'],)).fetchone()
-            if not row or row['owner'] != job['owner']:
-                raise ConfigError('Review ownership changed; request was preserved.')
+        row = self.db.execute('select owner from jobs where id=?', (job['id'],)).fetchone()
+        if not row or row['owner'] != job.get('owner'):
+            raise ConfigError('Review ownership changed; request was preserved.')
 
     def release(self, job):
         with self.db:
