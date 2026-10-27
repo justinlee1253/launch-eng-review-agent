@@ -2,7 +2,7 @@
 
 Automated pull request reviews requested through a dedicated Google Chat space. The agent acknowledges a request, reviews a captured commit using Falcon criteria, submits an approval or request for changes on GitHub, and reports the outcome in the original Chat thread.
 
-The service runs locally on macOS. A lightweight Python listener handles intake independently of one sequential review worker, so incoming requests can be acknowledged while another review is running. Model inference runs remotely through the authenticated Codex CLI; idle polling does not invoke a model.
+The service runs locally on macOS. A lightweight Python listener handles intake independently of one or two isolated review workers, so incoming requests can be acknowledged while another review is running. Model inference runs remotely through the authenticated Codex CLI; idle polling does not invoke a model.
 
 ## Using the agent
 
@@ -58,7 +58,7 @@ flowchart LR
     subgraph mac["Local macOS runtime"]
         listener["Python listener<br/>Polling and thread delivery"]
         queue[("SQLite<br/>Queue, outbox, review ledger")]
-        worker["Python review worker<br/>One PR at a time"]
+        worker["Python review worker<br/>1–2 workers, one PR each"]
         keychain["macOS Keychain<br/>Google OAuth grant"]
         policy["Falcon skill<br/>Review policy and repository guidance"]
     end
@@ -80,7 +80,7 @@ The interactive diagram is a standalone HTML file; download it and open it in a 
 ### Request lifecycle
 
 1. **Receive.** The listener polls only the configured space every two seconds on a healthy connection. It persists eligible requests and queues the acknowledgment and 👀 reaction before advancing the scan checkpoint.
-2. **Schedule.** A SQLite queue selects requests in original posting order. One worker processes a PR at a time; the listener continues receiving requests. Reposts attach to active work instead of creating another review.
+2. **Schedule.** A SQLite queue selects requests in original posting order. Each worker processes one PR at a time; the listener continues receiving requests. Reposts attach to active work instead of creating another review.
 3. **Check eligibility.** The worker verifies the GitHub account, PR state, existing reviews, and CI status before spending model tokens. Pending CI waits; failed CI, drafts, merged/closed PRs, and conflicts produce a held result.
 4. **Collect evidence.** GitHub REST reads retrieve complete text changes and relevant files at captured commit SHAs. The worker includes repository instructions, local architecture context, Falcon criteria, and the review policy. Additional evidence requests are restricted to approved files and directories.
 5. **Review.** The Codex subprocess returns structured findings or requests for more evidence. Absent supplemental files/directories are reported back to the reviewer so it can continue or explain a material evidence gap. The host saves the original draft and captured evidence before validating completeness and file/line references. A unique exact quotation can correct its own line number; other citation mismatches get at most one citation-only model pass, bounded to two minutes. Corrections cannot remove findings or change their meaning, blocking labels, or severity. Remaining mismatches hold the review with the exact finding, path, side, and line. Missing changed-file source or genuinely required context cannot produce an approval.
@@ -269,3 +269,16 @@ The suite uses fixtures for authorization, queue recovery, deduplication, eviden
 The text-review limits are 150 changed files, 250 KB per file, 1.2 million serialized context characters, up to eight evidence rounds, and ten minutes per model invocation. Binary files, symlinks, submodules, inaccessible required context, and exceeded limits hold for manual attention. A GitHub review is anchored to a commit; the API does not provide an atomic guarantee that it remains the latest head.
 
 Deployment acceptance must include a real threaded acknowledgment, the correct GitHub review identity, same-head deduplication, restart recovery, and silent token renewal. Unit tests and initial login alone do not establish live readiness.
+
+
+## Review worker capacity and safe rollout
+
+`worker_count` in `.runtime/config.json` accepts only the integers `1` and `2`; omitted means `1`. Restart to apply it. One process retains the existing lock, one Chat listener and one sender. Each worker creates its own SQLite connection, GitHub evidence cache and reviewer. Each attempt gets its own **twenty-minute total processing budget**, excluding queue and deferred CI waiting. Evidence collection, every model round, citation correction (at most two minutes within the remaining budget), and final publication checks share that deadline. Increasing capacity does not change model settings or per-PR criteria.
+
+SQLite claims use `BEGIN IMMEDIATE` and a unique owned-PR index. Ownership lasts through submission and reconciliation. A timeout or dashboard Stop affects only that request. Reserved writes remain reconciliation-only even if their response is lost or the process restarts; a repost attaches instead of starting another write. Interrupted model runs are held for explicit attention, with any unknown usage retained. Queue estimates use the next available worker and stay provisional; CI and unresolved writes have no invented completion time. Operational status and the dashboard show configured capacity and active workers (`Reviewing: 2/2`).
+
+Messages containing several PRs keep one status: 👀 while any is queued, reviewing, submitting or reconciling; then ⚠️ if any is unresolved; then 💬 if any requested changes; otherwise ✅ for approved outcomes, including reused approvals. History and other people's reactions are preserved.
+
+For deployment, finish active reviews before stopping the old process. Keep the same private runtime directory (database, drafts, outbox and saved authentication), acquire the existing process lock, and run startup recovery once before starting workers. First start with `worker_count: 1`, verify heartbeat, queue/history preservation and one listener, then drain active work again and restart with `worker_count: 2`. Observe genuine eligible requests when available; do not create requests or model spending just to test capacity. Measure process/model-child CPU and RSS and inspect per-PR records with `agent.py costs`. Roll back capacity by draining and restarting with `worker_count: 1`; never delete the queue or ledger. Graceful shutdown retains the process lock until all workers exit.
+
+The existing loopback dashboard is available with `.venv/bin/python dashboard.py`; it reuses the same runtime and exposes explicit remove/stop controls. No new services, dependencies or credentials are required.

@@ -12,5 +12,6 @@
     "approved": "✅",
     "changes_requested": "💬",
     "warning": "⚠️"
-  }
+  },
+  "worker_count": 1
 }

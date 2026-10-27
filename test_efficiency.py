@@ -65,6 +65,7 @@ class EfficiencyTests(unittest.TestCase):
         later = message('later', text='https://github.com/ROKT/launch-engineering/pull/6001', createTime='2026-10-26T18:53:00Z')
         self.store.ingest(self.config, [later], START, END, None)
         self.store.update(first, status='queued')
+        self.store.release(first)
         self.assertEqual(self.store.claim()['number'], 6000)
 
     def test_failed_pending_conflicted_and_draft_prs_do_not_start_the_model(self):

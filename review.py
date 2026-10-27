@@ -17,6 +17,7 @@ from agent import ConfigError, REPOS, ROOT, Store
 import usage
 import orbit_context
 import review_drafts
+from queue_controls import Cancelled
 
 
 SHA = re.compile(r'[0-9a-f]{40}')
@@ -161,6 +162,8 @@ class GitHub:
             raise ConfigError('Existing GitHub CLI is required.')
 
     def api(self, endpoint, payload=None):
+        if getattr(self, 'cancel_guard', None):
+            self.cancel_guard()
         if endpoint != 'user' and not any(endpoint == 'repos/' + repo or endpoint.startswith('repos/' + repo + '/')
                                          for repo in self.config.context_repositories):
             raise Incomplete('GitHub endpoint is outside the approved repository scope.')
@@ -502,7 +505,7 @@ class Reviewer:
             result = self._invoke(prompt, guard, schema=schema, timeout=timeout)
             status = 'completed'
             return result
-        except (HeadMoved, WaitForCI, WorkerStopped):
+        except (HeadMoved, WaitForCI, Cancelled, WorkerStopped):
             status = 'cancelled'
             raise
         except ReviewTimedOut:
@@ -547,6 +550,8 @@ class Reviewer:
                     stdin.seek(0)
                     if guard:
                         guard()
+                    if getattr(self, 'cancel_guard', None):
+                        self.cancel_guard()
                     if self.stop and self.stop.is_set():
                         raise WorkerStopped('Worker stopped during review; no completed verdict was returned.')
                     budget.remaining()
@@ -557,6 +562,8 @@ class Reviewer:
                     try:
                         next_guard = time.monotonic() + 15
                         while child.poll() is None:
+                            if getattr(self, 'cancel_guard', None):
+                                self.cancel_guard()
                             if self.stop and self.stop.is_set():
                                 raise WorkerStopped('Worker stopped during review; no completed verdict was returned.')
                             budget.remaining()
@@ -830,8 +837,16 @@ def review_one(config, store, github, reviewer, job):
     budget = ReviewBudget()
     github.budget = reviewer.budget = budget if job['status'] not in {'submitting', 'ambiguous'} else None
 
+    def cancel_guard():
+        if job['status'] not in {'submitting', 'ambiguous'} and store.cancellation_requested(job):
+            raise Cancelled()
+
+    github.cancel_guard = reviewer.cancel_guard = cancel_guard
     def hold(reason):
-        store.finish(job, 'needs-attention', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\nReview held — {reason}")
+        reserved = job['status'] in {'submitting', 'ambiguous'} and bool(job.get('payload'))
+        if reserved:
+            store.update(job, ready_after=time.time() + 60)
+        store.finish(job, 'ambiguous' if reserved else 'needs-attention', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\nReview held — {reason}")
 
     def moved(current, after=False):
         if current['head']['sha'] == job['head'] and current['base']['sha'] == job['base']:
@@ -854,6 +869,7 @@ def review_one(config, store, github, reviewer, job):
         return True
 
     try:
+        cancel_guard()
         if job['repo'] not in REPOS:
             raise Incomplete('Repository is no longer in the pilot allowlist; no review was posted.')
         stamp = job.get('mode') == 'stamp'
@@ -954,7 +970,8 @@ def review_one(config, store, github, reviewer, job):
         if getattr(reviewer, 'stop', None) and reviewer.stop.is_set():
             raise WorkerStopped('Worker stopped; no review was submitted.')
         budget.remaining()
-        store.update(job, status='submitting', payload=json.dumps(payload), marker=marker(job['repo'], job['number'], job['head'], stamp=stamp))
+        if not store.reserve_submission(job, payload, marker(job['repo'], job['number'], job['head'], stamp=stamp)):
+            raise Cancelled()
         try:
             try:
                 row = github.submit(job, payload)
@@ -975,6 +992,8 @@ def review_one(config, store, github, reviewer, job):
         verdict = 'Stamped' if stamp else 'Approved' if payload['event'] == 'APPROVE' else 'Requested changes'
         store.finish(job, 'submitted', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\n{verdict} — {output['summary']}\nGitHub review: {row['html_url']} · head {job['head'][:8]}",
                      'approved' if payload['event'] == 'APPROVE' else 'changes_requested')
+    except Cancelled:
+        store.finish(job, 'cancelled', f"{job['repo']}#{job['number']} — Cancelled from the dashboard. No GitHub review was submitted. Model usage may include work already completed; post the PR again to request a new review.")
     except WaitForCI as error:
         if error.retry:
             store.update(job, ready_after=time.time() + 60)
@@ -987,4 +1006,5 @@ def review_one(config, store, github, reviewer, job):
         reason = str(error) if isinstance(error, (Incomplete, ConfigError)) else type(error).__name__ + '; required GitHub evidence is unavailable.'
         hold(reason)
     finally:
+        github.cancel_guard = reviewer.cancel_guard = None
         github.budget = reviewer.budget = None
