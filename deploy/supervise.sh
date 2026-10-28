@@ -6,7 +6,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
 LOG="$ROOT/.runtime/agent.out"
 child=""
-trap 'if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; exit 0' TERM INT
+sleeper=""
+shutdown() {
+  if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi
+  if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null; fi
+  echo "$(date -u +%FT%TZ) supervise: stopped" >> "$LOG"
+  exit 0
+}
+trap shutdown TERM INT
 while true; do
   started=$(date +%s)
   echo "$(date -u +%FT%TZ) supervise: starting worker" >> "$LOG"
@@ -18,5 +25,8 @@ while true; do
   # A worker that dies within a minute is usually misconfigured; back off so the log stays readable.
   if [ $(( $(date +%s) - started )) -lt 60 ]; then delay=60; else delay=10; fi
   echo "$(date -u +%FT%TZ) supervise: worker exited with status $code; restarting in ${delay}s" >> "$LOG"
-  sleep "$delay"
+  # Background sleep + wait keeps the TERM trap responsive; a foreground sleep would defer it.
+  sleep "$delay" & sleeper=$!
+  wait "$sleeper"
+  sleeper=""
 done
