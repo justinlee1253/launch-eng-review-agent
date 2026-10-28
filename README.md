@@ -96,6 +96,8 @@ After expiry, the request is held and no new review write starts. Any completed 
 
 Chat receipts and start updates use short Orbit/launch-themed wording, the number of earlier reviews, and one approximate finish time. Duplicate requests link to the original thread and reuse existing work. Warning messages state the next action and whether it belongs to the requester, an automatic recheck, or the agent maintainer. Maintainer-only failures use a real Justin mention and a short run reference; repeated unchanged warnings reuse the durable outbox entry.
 
+Completed results retain a substantive overview and every finding and required action, grouped into blockers and non-blocking concerns. GitHub uses readable When/Impact/Fix paragraphs inline, or in the review body when a finding cannot attach to a diff line. Reviewed SHAs, citation checks, validation limits and hidden reconciliation markers remain intact. Long Chat results split into durable numbered replies rather than dropping findings to fit the transport limit.
+
 Reviews prioritize material correctness bugs, vulnerabilities, broken contracts, data loss, reliability failures, and consequential design flaws. Formatting preferences, naming tastes, speculative rewrites, and missing tests alone do not block a merge. A complete review with no material blockers approves; substantiated blockers request changes.
 
 The review inputs are:

@@ -188,9 +188,15 @@ class Store:
             self.event(code, unique='chat_blocked:' + code)
 
     def _outbox(self, key, kind, target, payload):
-        id = str(uuid.uuid5(uuid.NAMESPACE_URL, key))
-        self.db.execute('insert or ignore into outbox(id,kind,target,payload) values(?,?,?,?)',
-                        (id, kind, target, json.dumps(payload)))
+        parts = chat_messages.chunks(payload['text']) if kind == 'message' else [None]
+        for number, part in enumerate(parts, 1):
+            part_key, value = key, payload
+            if len(parts) > 1:
+                part_key = key+f':part:{number}'
+                value = {**payload, 'text': f'Orbit review ({number}/{len(parts)})\n'+part}
+            id = str(uuid.uuid5(uuid.NAMESPACE_URL, part_key))
+            self.db.execute('insert or ignore into outbox(id,kind,target,payload) values(?,?,?,?)',
+                            (id, kind, target, json.dumps(value)))
 
     def _reaction(self, message, emoji):
         id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'reaction:' + message))

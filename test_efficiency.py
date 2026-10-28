@@ -90,8 +90,9 @@ class EfficiencyTests(unittest.TestCase):
         self.assertIn('without code review', self.github.submitted[0]['body'])
         self.assertEqual(self.store.history()[0]['mode'], 'stamp')
         result = self.store.history()[0]['result']
-        self.assertIn('Stamped — approved as requested without code review.', result)
-        self.assertIn('head ' + HEAD[:8], result)
+        self.assertIn('— Stamped', result)
+        self.assertIn('Approved as requested without code review.', result)
+        self.assertIn('Commit: ' + HEAD[:8], result)
 
     def test_stamp_email_in_message_or_display_name_cannot_grant_permission(self):
         for sender in ({'name': 'users/other', 'email': 'other@rokt.com', 'displayName': 'Mani Vedma', 'type': 'HUMAN'},
