@@ -121,7 +121,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(payload['event'], 'REQUEST_CHANGES')
         self.assertEqual(payload['comments'][0]['line'], 1)
         self.assertEqual(payload['comments'][0]['side'], 'RIGHT')
-        self.assertIn('**Blocking:**', payload['comments'][0]['body'])
+        self.assertIn('**Blocking —', payload['comments'][0]['body'])
         reactions = [json.loads(row[0])['emoji']['unicode'] for row in self.store.db.execute("select payload from outbox where kind='reaction'")]
         self.assertEqual(reactions, ['👀', '💬'])
 

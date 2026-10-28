@@ -13,6 +13,49 @@ def plain(value):
     return value.replace('<', '‹').replace('>', '›')
 
 
+def paragraphs(value):
+    return '\n\n'.join(line.strip() for line in value.splitlines() if line.strip())
+
+
+def chunks(text):
+    # Leave room below Chat's 32 KB limit, including JSON escaping and thread metadata.
+    remaining, parts = text.encode('utf-8'), []
+    while remaining:
+        part = remaining[:8000].decode('utf-8', errors='ignore')
+        if len(remaining) > 8000 and '\n' in part:
+            part = part[:part.rfind('\n')+1]
+        parts.append(part)
+        remaining = remaining[len(part.encode('utf-8')):]
+    return parts or [text]
+
+
+def validation(ci):
+    state = (ci or {}).get('state', 'unverified')
+    description = {'passed': 'passed at review time', 'none': 'no checks reported',
+                   'failed': 'failed', 'pending': 'pending'}.get(state, 'unverified')
+    return 'Tests were not run. CI: ' + description + '.'
+
+
+def review_result(job, output, url, ci, *, stamp=False):
+    findings = output.get('findings', [])
+    blockers = [item for item in findings if item['blocking']]
+    notes = [item for item in findings if not item['blocking']]
+    verdict = 'Stamped' if stamp else 'Changes requested' if blockers else 'Approved'
+    lines = [f"{job['repo']}#{job['number']} — {verdict}", '',
+             'Approved as requested without code review.' if stamp else plain(paragraphs(output['summary']))]
+    for label, items in [('Required fixes', blockers), ('Non-blocking concerns', notes)]:
+        if items:
+            lines += ['', f'{label} ({len(items)}):']
+            for item in items:
+                title = plain(' '.join(item['title'].split()))
+                fix = plain(' '.join(item['fix'].split()))
+                lines += [f'• {title}', f'  Next: {fix}']
+    if not stamp:
+        lines += ['', validation(ci)]
+    lines += ['', f"<{url}|GitHub review> · Commit: {job['head'][:8]}"]
+    return '\n'.join(lines)
+
+
 def original_request(first):
     date = datetime.fromisoformat(first['created_at'].replace('Z', '+00:00')).astimezone(ZoneInfo('America/New_York'))
     clock = date.strftime('%b %d, %I:%M %p ET').replace(' 0', ' ')

@@ -14,8 +14,10 @@ import tempfile
 import time
 import traceback
 import uuid
+from urllib.parse import quote
 
 from agent import ConfigError, REPOS, ROOT, Store
+import messages as chat_messages
 import usage
 import diagnostics
 
@@ -676,21 +678,30 @@ def validate_result(output, evidence):
 def review_payload(job, evidence, output):
     validate_result(output, evidence)
     blockers = sum(f['blocking'] for f in output['findings'])
-    body = ['Automated review using Justin\'s Falcon criteria.', '',
-            ('Requested changes' if blockers else 'Approved') + f' — {blockers} blocking findings.', output['summary']]
+    body = ['## ' + ('Changes requested' if blockers else 'Approved'), '', chat_messages.paragraphs(output['summary'])]
     comments = []
-    for finding in output['findings']:
-        label = 'Blocking' if finding['blocking'] else 'Non-blocking'
-        text = (f"**{label}:** {finding['title']}\n\nScenario: {finding['scenario']}\n"
-                f"Impact: {finding['impact']}\nEvidence: `{finding['evidence']}`\nFix / question: {finding['fix']}")
-        body += ['', f"[{label.lower()}] {finding['path']}:{finding['line']} — {finding['title']}"]
-        if (finding['path'], finding['side'], finding['line']) in evidence.inline:
-            comments.append({'path': finding['path'], 'line': finding['line'], 'side': finding['side'], 'body': text})
-        else:
-            body += [text]
-    body += ['', 'Reviewed head: ' + evidence.head,
-             'Validation: Tests were not run locally. Review used captured remote source; CI preflight state: '
-             + (evidence.ci or {}).get('state', 'unverified') + '. Unreported checks are not assumed to pass.',
+    for blocking, heading in [(True, 'Required fixes'), (False, 'Non-blocking concerns')]:
+        items = [finding for finding in output['findings'] if finding['blocking'] == blocking]
+        if not items:
+            continue
+        body += ['', f'### {heading} ({len(items)})', '']
+        for finding in items:
+            label = 'Blocking' if blocking else 'Non-blocking'
+            title = ' '.join(finding['title'].split())
+            text = (f"**{label} — {title}**\n\n**When:** {finding['scenario']}\n\n"
+                    f"**Impact:** {finding['impact']}\n\n**Fix:** {finding['fix']}")
+            ref = evidence.head if finding['side'] == 'RIGHT' else evidence.ancestor
+            path = finding['path'] if finding['side'] == 'RIGHT' else evidence.old_paths.get(finding['path'], finding['path'])
+            url = f"https://github.com/{job['repo']}/blob/{ref}/{quote(path, safe='/')}#L{finding['line']}"
+            label_path = path.replace('[', '\\[').replace(']', '\\]')
+            location = f"[{label_path}:{finding['line']}]({url})"
+            if (finding['path'], finding['side'], finding['line']) in evidence.inline:
+                body += [f'- **{title}** — {location}']
+                comments.append({'path': finding['path'], 'line': finding['line'], 'side': finding['side'], 'body': text})
+            else:
+                body += [text, location, '']
+    body += ['', '**Reviewed commit:** `' + evidence.head + '`',
+             '**Validation:** ' + chat_messages.validation(evidence.ci), 'Automated review by Orbit.',
              '', marker(job['repo'], job['number'], evidence.head)]
     return {'event': 'REQUEST_CHANGES' if blockers else 'APPROVE', 'commit_id': evidence.head,
             'body': '\n'.join(body), 'comments': comments}
@@ -849,8 +860,7 @@ def review_one(config, store, github, reviewer, job):
         if current['state'] != 'open' or current.get('merged') or current.get('draft'):
             store.finish(job, 'submitted', f"{job['repo']}#{job['number']} — Review submitted for {job['head'][:8]}, but the PR is now closed, merged, or draft.\nGitHub review: {row['html_url']}")
             return
-        verdict = 'Stamped' if stamp else 'Approved' if payload['event'] == 'APPROVE' else 'Requested changes'
-        store.finish(job, 'submitted', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\n{verdict} — {output['summary']}\nGitHub review: {row['html_url']} · head {job['head'][:8]}",
+        store.finish(job, 'submitted', chat_messages.review_result(job, output, row['html_url'], ci, stamp=stamp),
                      'approved' if payload['event'] == 'APPROVE' else 'changes_requested')
     except WaitForCI as error:
         if error.retry:
