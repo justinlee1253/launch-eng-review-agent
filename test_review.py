@@ -123,7 +123,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(payload['comments'][0]['side'], 'RIGHT')
         self.assertIn('**Blocking:**', payload['comments'][0]['body'])
         reactions = [json.loads(row[0])['emoji']['unicode'] for row in self.store.db.execute("select payload from outbox where kind='reaction'")]
-        self.assertEqual(reactions, ['👀', '💬'])
+        self.assertEqual(reactions, ['💬'])
 
     def test_incomplete_missing_lens_and_missing_file_cannot_approve(self):
         for output in [result(status='incomplete'), result(lenses=['security']), result(reviewed_files=[])]:
@@ -202,8 +202,10 @@ class ReviewTests(unittest.TestCase):
         self.store.update(self.job, status='submitting', head=HEAD, marker='marker', payload=json.dumps({'event': 'APPROVE'}))
         self.store.recover()
         self.job = self.store.claim()
-        self.assertEqual(self.run_review()['status'], 'needs-attention')
+        self.assertEqual(self.run_review()['status'], 'ambiguous')
         self.assertEqual(self.github.submitted, [])
+        self.store.ingest(self.config, [message('repost')], START, END, None)
+        self.assertEqual(len(self.store.history()), 1)
 
     def test_chat_failure_after_submission_does_not_rerun_review(self):
         self.run_review()
