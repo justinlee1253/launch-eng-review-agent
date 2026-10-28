@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import queue_eta
 import queue_controls
+import deployment
 
 ROOT = Path(__file__).resolve().parent
 ACTIVE = ('reviewing', 'submitting', 'ambiguous', 'queued', 'waiting_ci')
@@ -173,7 +174,7 @@ def server(runtime, port=8765):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--runtime', type=Path, default=ROOT / '.runtime')
+    parser.add_argument('--runtime', type=Path, default=deployment.runtime_path(ROOT))
     parser.add_argument('--port', type=int, default=8765)
     args = parser.parse_args()
     with server(args.runtime, args.port) as dashboard:

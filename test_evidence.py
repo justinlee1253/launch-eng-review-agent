@@ -8,7 +8,8 @@ import tempfile
 import unittest
 
 from agent import Config
-from review import Evidence, GitHub, Incomplete, Reviewer
+from review import Evidence, GitHub, Incomplete, Reviewer, skill_text
+from unittest.mock import patch
 from test_agent import SPACE, START
 from test_review import BASE, HEAD, PR, result
 
@@ -121,6 +122,19 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(sum('/git/ref/heads/main' in call for call in self.github.calls), 1)
         tree_calls = [c for c in self.github.calls if '/git/trees/' in c]
         self.assertTrue(all(c.endswith('d' * 40) for c in tree_calls))
+
+    def test_skill_text_honours_environment_override_and_fails_closed(self):
+        skill = Path(self.tmp.name) / 'SKILL.md'
+        skill.write_text('# Falcon\nReview criteria.\n')
+        with patch.dict(os.environ, {'REVIEW_AGENT_SKILL_FILE': str(skill)}):
+            self.assertEqual(skill_text(), '# Falcon\nReview criteria.\n')
+        with patch.dict(os.environ, {'REVIEW_AGENT_SKILL_FILE': str(skill) + '.missing'}):
+            with self.assertRaises(Incomplete):
+                skill_text()
+        skill.write_text('   \n')
+        with patch.dict(os.environ, {'REVIEW_AGENT_SKILL_FILE': str(skill)}):
+            with self.assertRaises(Incomplete):
+                skill_text()
 
     def test_model_process_receives_no_shell_tokens_or_external_tools(self):
         executable = Path(self.tmp.name) / 'fake-codex'

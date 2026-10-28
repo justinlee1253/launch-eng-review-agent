@@ -2,7 +2,7 @@
 
 Automated pull request reviews requested through a dedicated Google Chat space. The agent acknowledges a request, reviews a captured commit using Falcon criteria, submits an approval or request for changes on GitHub, and reports the outcome in the original Chat thread.
 
-The service runs locally on macOS. A lightweight Python listener handles intake independently of one or two isolated review workers, so incoming requests can be acknowledged while another review is running. Model inference runs remotely through the authenticated Codex CLI; idle polling does not invoke a model.
+The service runs on macOS or a persistent Linux host (see [deployment](deploy/CLOUD.md)). A lightweight Python listener handles intake independently of one or two isolated review workers, so incoming requests can be acknowledged while another review is running. Model inference runs remotely through the authenticated Codex CLI; idle polling does not invoke a model.
 
 ## Using the agent
 
@@ -21,7 +21,7 @@ https://github.com/ROKT/launch-engineering/pull/1234
 
 Every PR request message, including thread replies, has one current agent status. Status updates remove the agent's previous status before adding the new one; other people's reactions are preserved. Google exposes separate delete/create calls, so a transition can briefly show no status. Reposting the same reviewed commit reuses the existing result without another model review. A new commit can receive a fresh review.
 
-Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Everyone in the designated space, including the operator, can request a review. The agent ignores its own outgoing replies and bot messages; PRs authored by either configured operator GitHub identity remain excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
+Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as the configured actor (`justinlee1253` by default). Everyone in the designated space, including the operator, can request a review. The agent ignores its own outgoing replies and bot messages; PRs authored by either configured operator GitHub identity remain excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
 
 ### STAMP exception
 
@@ -98,7 +98,7 @@ Reviews prioritize material correctness bugs, vulnerabilities, broken contracts,
 
 The review inputs are:
 
-- The installed Falcon skill, currently loaded from `~/.codex/skills/avengers-falcon/SKILL.md`.
+- The Falcon skill, read from `REVIEW_AGENT_SKILL_FILE`, else `skills/avengers-falcon/SKILL.md` in this repository, else the pilot's `~/.codex/skills/avengers-falcon/SKILL.md`.
 - The agent-specific [review policy](review-policy.md), which defines automation permissions and overrides interactive skill behavior.
 - Repository guidance and source evidence at captured SHAs, plus required local architecture references.
 
@@ -142,7 +142,7 @@ On a fresh installation, use the downloaded Desktop OAuth client file:
 .venv/bin/python auth.py check --force-refresh
 ```
 
-The supported Google OAuth library requests offline access and verifies that a refresh token was issued. The grant is stored in macOS Keychain. Background operation renews access tokens silently and never opens an authorization browser.
+The supported Google OAuth library requests offline access and verifies that a refresh token was issued. The grant is stored in macOS Keychain, or in an owner-only `.runtime/google-grant.json` on other platforms (seeded from the `GOOGLE_CHAT_GRANT_JSON` environment secret; `REVIEW_AGENT_GRANT_FILE` overrides the location). `auth.py whoami` prints the Chat user resource for `configure --self-user`. Background operation renews access tokens silently and never opens an authorization browser.
 
 Required scopes:
 
@@ -190,6 +190,10 @@ Polling and reaction settings live in `.runtime/config.json`. The current suppor
 ```
 
 These keys belong under `reactions`. Preserve the configured space, activation timestamp, and database when changing presentation settings. Restart the process after editing configuration.
+
+### Persistent Linux deployment
+
+`deploy/ensure.sh` requires an existing enrolled persistent runtime; it never recreates a queue after state loss. [deploy/CLOUD.md](deploy/CLOUD.md) describes offline host handoff and health checks. Ephemeral Claude cloud sessions are not production daemon hosts.
 
 ### Enable login startup
 

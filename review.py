@@ -23,7 +23,9 @@ from queue_controls import Cancelled
 
 
 SHA = re.compile(r'[0-9a-f]{40}')
-JUSTIN = {'justinlee1253', 'justin-lee_rokt'}
+SKILL_FILE_ENV = 'REVIEW_AGENT_SKILL_FILE'
+SKILL_PATHS = (ROOT / 'skills' / 'avengers-falcon' / 'SKILL.md',
+               Path('/Users/jklee/.codex/skills/avengers-falcon/SKILL.md'))
 MAX_CONTEXT = 1_200_000
 MAX_FILE = 250_000
 REVIEW_SECONDS = 1200
@@ -650,10 +652,7 @@ class Reviewer:
 
     def review(self, github, evidence):
         policy = (ROOT / 'review-policy.md').read_text()
-        try:
-            skill = Path('/Users/jklee/.codex/skills/avengers-falcon/SKILL.md').read_text()
-        except OSError:
-            raise Incomplete('The required Falcon skill is unavailable.') from None
+        skill = skill_text()
         for path, text in [(str(ROOT / 'review-policy.md'), policy),
                            ('/Users/jklee/.codex/skills/avengers-falcon/SKILL.md', skill)]:
             evidence.provenance = [row for row in evidence.provenance if row['path'] != path] + [
@@ -850,9 +849,23 @@ def review_payload(job, evidence, output):
             'body': '\n'.join(body), 'comments': comments}
 
 
-def own_timeline(rows):
+def skill_text():
+    """The Falcon skill from the environment override, the repository copy, or the pilot's local path."""
+    override = os.environ.get(SKILL_FILE_ENV)
+    candidates = [Path(override).expanduser()] if override else list(SKILL_PATHS)
+    for path in candidates:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        if text.strip():
+            return text
+    raise Incomplete('The required Falcon skill is unavailable.')
+
+
+def own_timeline(rows, operators):
     return [(row.get('id'), row.get('state'), row.get('updated_at'), row.get('body'))
-            for row in rows if row.get('user', {}).get('login') in JUSTIN]
+            for row in rows if row.get('user', {}).get('login') in operators]
 
 
 def verified_review(row, job, actor):
@@ -911,6 +924,7 @@ def review_one(config, store, github, reviewer, job):
             store.finish(job, 'queued', reason + ' Queued a fresh review after a short stability delay.')
         return True
 
+    operators = set(config.operator_logins)
     try:
         cancel_guard()
         if job['repo'] not in REPOS:
@@ -920,7 +934,7 @@ def review_one(config, store, github, reviewer, job):
         if stamp and not stamp_email:
             raise Incomplete('STAMP requester is not currently authorized; no approval or model run is allowed.')
         if github.actor() != config.actor:
-            raise Incomplete('Authenticated GitHub account differs from justinlee1253; no account was switched.')
+            raise Incomplete('Authenticated GitHub account differs from ' + config.actor + '; no account was switched.')
         if job['status'] in {'submitting', 'ambiguous'}:
             context['stage'] = 'reconciliation'
             review = reconcile(github, job, config.actor)
@@ -932,8 +946,8 @@ def review_one(config, store, github, reviewer, job):
                          'approved' if review['state'] == 'APPROVED' else 'changes_requested')
             return
         pr = github.pr(job['repo'], job['number'])
-        if pr['state'] != 'open' or pr.get('merged') or pr.get('user', {}).get('login') in JUSTIN:
-            reason = 'The PR is merged' if pr.get('merged') else 'The PR is closed' if pr['state'] != 'open' else 'PR is authored by Justin; self-approval is excluded'
+        if pr['state'] != 'open' or pr.get('merged') or pr.get('user', {}).get('login') in operators:
+            reason = 'The PR is merged' if pr.get('merged') else 'The PR is closed' if pr['state'] != 'open' else 'PR is authored by the review operator; self-approval is excluded'
             store.finish(job, 'skipped', f"{job['repo']}#{job['number']} — Review held: {reason}; no review submitted.")
             return
         if pr.get('draft'):
@@ -941,7 +955,7 @@ def review_one(config, store, github, reviewer, job):
         store.update(job, head=check_sha(pr['head']['sha']), base=check_sha(pr['base']['sha']))
         reviews = github.reviews(job['repo'], job['number'])
         comments = github.comments(job['repo'], job['number'])
-        effective = [row for row in reviews if row.get('user', {}).get('login') in JUSTIN
+        effective = [row for row in reviews if row.get('user', {}).get('login') in operators
                      and row.get('state') in {'APPROVED', 'CHANGES_REQUESTED'}]
         same_head = [row for row in effective if row.get('commit_id') == job['head']]
         if same_head:
@@ -956,10 +970,10 @@ def review_one(config, store, github, reviewer, job):
         latest_by_actor = {row['user']['login']: row for row in effective}
         if any(row.get('state') == 'CHANGES_REQUESTED' and '<!-- justin-falcon-review:' not in (row.get('body') or '')
                for row in latest_by_actor.values()):
-            raise Incomplete('Justin has a manual blocking review; do not overwrite that decision automatically.')
-        if any(row.get('user', {}).get('login') in JUSTIN and row.get('state') in {'COMMENTED', 'PENDING'}
+            raise Incomplete('The operator has a manual blocking review; do not overwrite that decision automatically.')
+        if any(row.get('user', {}).get('login') in operators and row.get('state') in {'COMMENTED', 'PENDING'}
                and row.get('commit_id') == job['head'] and '<!-- justin-falcon-review:' not in (row.get('body') or '') for row in reviews):
-            raise Incomplete('Justin has an unfinished manual review at this head; ownership of the decision needs attention.')
+            raise Incomplete('The operator has an unfinished manual review at this head; ownership of the decision needs attention.')
         ci = require_ready(github, job, pr)
         if not pr.get('changed_files', 1):
             raise WaitForCI('No changed files; no review is needed.')
@@ -974,8 +988,8 @@ def review_one(config, store, github, reviewer, job):
             record = archive.latest(job['repo'], job['number'], job['head'], job['base'])
             if record:
                 evidence = restore_draft(record, job)
-                if (own_timeline(evidence.description.get('existing_reviews_untrusted', [])) != own_timeline(reviews)
-                        or own_timeline(evidence.description.get('inline_comments_untrusted', [])) != own_timeline(comments)):
+                if (own_timeline(evidence.description.get('existing_reviews_untrusted', []), operators) != own_timeline(reviews, operators)
+                        or own_timeline(evidence.description.get('inline_comments_untrusted', []), operators) != own_timeline(comments, operators)):
                     raise Incomplete('An intervening Justin review/comment prevents reuse of the retained draft.')
                 evidence.ci = ci
                 evidence.check_dependencies(github)
@@ -1003,8 +1017,9 @@ def review_one(config, store, github, reviewer, job):
             raise Incomplete('GitHub account changed during review; posting paused.')
         latest_reviews = github.reviews(job['repo'], job['number'])
         latest_comments = github.comments(job['repo'], job['number'])
-        if own_timeline(reviews) != own_timeline(latest_reviews) or own_timeline(comments) != own_timeline(latest_comments):
-            raise Incomplete('An intervening Justin review/comment requires a manual decision.')
+        if (own_timeline(reviews, operators) != own_timeline(latest_reviews, operators)
+                or own_timeline(comments, operators) != own_timeline(latest_comments, operators)):
+            raise Incomplete('An intervening operator review/comment requires a manual decision.')
         current = github.pr(job['repo'], job['number'])
         if current['state'] != 'open' or current.get('draft') or current.get('merged'):
             raise Incomplete('PR closed or became draft before submission; no review was posted.')
