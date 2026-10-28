@@ -38,13 +38,33 @@ class IntakeTests(unittest.TestCase):
                 'https://github.com@evil.test/ROKT/catalog/pull/1')
         self.assertEqual(agent.pr_links(text), [('ROKT/launch-engineering', 12)])
 
-    def test_wrong_space_own_bot_and_old_messages_are_ignored(self):
+    def test_wrong_space_bot_and_old_messages_are_ignored(self):
         bad = [message(space={'name': 'spaces/other'}),
-               message(sender={'name': self.config.self_user, 'type': 'HUMAN'}),
                message(sender={'name': 'users/bot', 'type': 'BOT'}),
                message(createTime='2026-10-26T18:49:59Z'),
                message(thread={'name': 'spaces/other/threads/thread1'})]
         self.store.ingest(self.config, bad, START, END, None)
+        self.assertEqual(self.store.history(), [])
+
+    def test_operator_can_request_a_review_and_get_receipt(self):
+        msg = message(sender={'name': self.config.self_user, 'type': 'HUMAN'})
+        self.store.ingest(self.config, [msg], START, END, None)
+        self.assertEqual(len(self.store.history()), 1)
+        self.assertEqual(self.store.db.execute('select count(*) from outbox').fetchone()[0], 2)
+
+    def test_agent_replies_do_not_loop_even_after_a_lost_send_response(self):
+        text = 'Approved — https://github.com/ROKT/launch-engineering/pull/6000'
+        msg = message('agentreply', text=text,
+                      sender={'name': self.config.self_user, 'type': 'HUMAN'})
+        with self.store.db:
+            self.store._outbox('result', 'message', msg['thread']['name'],
+                               {'text': text, 'thread': msg['thread']})
+        self.store.ingest(self.config, [msg], START, END, None)
+        self.assertEqual(self.store.history(), [])
+        with self.store.db:
+            self.store.db.execute("update outbox set status='sent',response_name=?", (msg['name'],))
+        msg['text'] += ' (edited)'
+        self.store.ingest(self.config, [msg], START, END, None)
         self.assertEqual(self.store.history(), [])
 
     def test_pagination_and_queue_are_committed_together_and_survive_restart(self):
