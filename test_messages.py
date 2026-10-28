@@ -63,6 +63,31 @@ class MessageTests(unittest.TestCase):
         self.assertNotIn('No review posted', text)
         self.assertNotIn('No GitHub review was posted', text)
 
+    def test_size_holds_do_not_claim_an_existing_manual_review(self):
+        reasons = [
+            'Evidence exceeds the pilot context budget; manual review is required.',
+            'Saved review progress exceeds the context budget; manual review is required.',
+            'Review input has 1,122,348 characters; the Codex CLI limit is 1,048,576. '
+            'Compact the evidence or review manually; no model call started.',
+        ]
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                text = self.finish(reason)
+                self.assertIn('exceeds the supported text-review limits', text)
+                self.assertNotIn('existing manual review', text)
+                self.assertNotIn('resolve the manual review decision', text)
+
+    def test_manual_review_warning_requires_a_known_review_condition(self):
+        for reason in (
+            'Justin has a manual blocking review; do not overwrite that decision automatically.',
+            'Justin has an unfinished manual review at this head; ownership of the decision needs attention.',
+            'Ledger records this head, but its effective review is missing or dismissed; manual decision required.',
+            'An intervening Justin review/comment requires a manual decision.',
+        ):
+            with self.subTest(reason=reason):
+                self.assertIn('existing manual review', self.finish(reason))
+        self.assertNotIn('existing manual review', self.finish('Unexpected failure; inspect manually.'))
+
     def test_repeated_identical_warning_does_not_send_another_mention(self):
         reason = 'Referenced dependency changed during review: ROKT/launch-engineering#86'
         self.finish(reason)
