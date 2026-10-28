@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 from agent import Config, Store
 from test_agent import SPACE, START, END, message
-from test_review import PR
+from test_review import PR, GitHub as FixtureGitHub, snapshot
+import diagnostics
 import review
 
 
@@ -57,6 +58,115 @@ class DiagnosticTests(unittest.TestCase):
         self.assertGreaterEqual(failed['elapsed_ms'], 0)
         self.assertNotIn(SECRET, '\n'.join(logs.output))
         self.assertEqual(store.history()[0]['status'], 'needs-attention')
+        warning = store.history()[0]['result']
+        self.assertIn('GET /repos/ROKT/launch-engineering/pulls/6000/reviews', warning)
+        self.assertIn('HTTP 503', warning)
+        self.assertIn('server_error', warning)
+        self.assertIn(failed['diagnostic_id'], warning)
+        self.assertNotIn(SECRET, warning)
+
+    def test_model_provider_failure_survives_chat_formatting_without_raw_text(self):
+        store = Store(self.root / 'state.sqlite3')
+        self.addCleanup(store.db.close)
+        store.ingest(self.config, [message()], START, END, None)
+        job = store.claim()
+        reviewer = review.Reviewer(self.root)
+
+        def process(args, **kwargs):
+            kwargs['stdout'].write((json.dumps({'type': 'turn.failed', 'error': {
+                'code': 'context_length_exceeded', 'message': SECRET}}) + '\n').encode())
+            kwargs['stderr'].write(('HTTP 400 ' + SECRET).encode())
+            return SimpleNamespace(returncode=1, poll=lambda: 1)
+
+        with patch('review.subprocess.Popen', side_effect=process):
+            with self.assertLogs('review-agent', level='INFO') as logs:
+                with self.assertRaises(review.Incomplete) as caught:
+                    reviewer.invoke(SECRET, job=job['id'])
+        error = caught.exception
+        store.finish(job, 'needs-attention', str(error), diagnostic=error.diagnostic)
+        warning = store.history()[0]['result']
+        self.assertIn('context_length_exceeded', warning)
+        self.assertIn('HTTP 400', warning)
+        self.assertIn('exit 1', warning)
+        self.assertIn('process_exit', warning)
+        finished = next(row for row in self.records(logs) if row['event'] == 'model_run_finished')
+        self.assertEqual(finished['prompt_bytes'], len(SECRET.encode()))
+        self.assertEqual(finished['provider_code'], 'context_length_exceeded')
+        self.assertIn(finished['diagnostic_id'], warning)
+        self.assertNotIn('check saved login', warning)
+        self.assertNotIn(SECRET, warning + '\n'.join(logs.output))
+
+    def test_followup_records_evidence_growth_and_round_on_the_failed_model_run(self):
+        evidence = snapshot()
+        evidence.number, evidence.job_id = 6000, 'round-job'
+        github = FixtureGitHub()
+        github.repo_path = review.GitHub(self.config, self.root).repo_path
+        github.file = lambda *args, **kwargs: SECRET * 100
+        reviewer = review.Reviewer(self.root)
+        calls = [0]
+
+        def process(args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps({
+                    'status': 'needs_evidence', 'requests': [{'repo': 'ROKT/launch-engineering',
+                    'ref': 'head', 'path': 'dependency.py', 'kind': 'file'}]}))
+                return SimpleNamespace(returncode=0, poll=lambda: 0)
+            kwargs['stderr'].write(b'HTTP 502 request_id=req_0123456789abcdef0123456789abcdef')
+            return SimpleNamespace(returncode=1, poll=lambda: 1)
+
+        with patch('review.subprocess.Popen', side_effect=process):
+            with self.assertLogs('review-agent', level='INFO') as logs:
+                with self.assertRaises(review.Incomplete):
+                    reviewer.review(github, evidence)
+        rows = self.records(logs)
+        starts = [row for row in rows if row['event'] == 'model_run_started']
+        self.assertEqual([row['review_round'] for row in starts], [1, 2])
+        self.assertEqual([row['document_count'] for row in starts], [1, 2])
+        self.assertGreater(starts[1]['prompt_bytes'], starts[0]['prompt_bytes'])
+        finished = next(row for row in rows if row['event'] == 'model_run_finished' and row['status'] == 'failed')
+        self.assertEqual(finished['review_round'], 2)
+        self.assertEqual(finished['provider_request_id'], 'req_0123456789abcdef0123456789abcdef')
+        self.assertGreater(finished['stderr_bytes'], 0)
+        self.assertIn('cli_version', finished)
+        self.assertNotIn(SECRET, '\n'.join(logs.output))
+
+    def test_unknown_provider_error_has_fingerprint_without_leaking_message(self):
+        detail = diagnostics.provider_failure(SECRET)
+        self.assertEqual(detail['error_category'], 'unknown')
+        self.assertEqual(len(detail['error_fingerprint']), 64)
+        self.assertNotIn(SECRET, json.dumps(detail))
+
+    def test_provider_failures_distinguish_actionable_causes_without_retaining_messages(self):
+        cases = [('context_length_exceeded', 'context_limit'),
+                 ('invalid_json_schema', 'invalid_schema'),
+                 ('model_not_found', 'model_unavailable'),
+                 ('refresh_token_expired', 'authentication'),
+                 ('rate_limit_exceeded', 'rate_limited'),
+                 ('unexpected argument --fixture', 'configuration'),
+                 ('stream disconnected', 'network')]
+        for error, category in cases:
+            with self.subTest(error=error):
+                detail = diagnostics.provider_failure(error + ' ' + SECRET)
+                self.assertEqual(detail['error_category'], category)
+                self.assertNotIn(SECRET, json.dumps(detail))
+
+    def test_missing_required_github_blob_keeps_path_and_status_but_optional_file_stays_optional(self):
+        github = review.GitHub(self.config, self.root)
+        github.directory_entries = lambda *args: [{'path': 'dependency.py', 'type': 'blob',
+                                                  'mode': '100644', 'sha': 'd' * 40}]
+        evidence = snapshot()
+        response = SimpleNamespace(returncode=1, stdout=SECRET.encode(), stderr=b'HTTP 404')
+        with patch('review.subprocess.run', return_value=response):
+            with self.assertLogs('review-agent', level='WARNING') as logs:
+                with self.assertRaises(review.Incomplete) as caught:
+                    evidence.read(github, 'ROKT/launch-engineering', 'a' * 40, 'dependency.py')
+                github.directory_entries = lambda *args: []
+                self.assertIsNone(evidence.read(github, 'ROKT/launch-engineering', 'a' * 40,
+                                               'dependency.py', optional=True))
+        self.assertEqual(caught.exception.diagnostic['http_status'], 404)
+        self.assertEqual(self.records(logs)[0]['source_path'], 'dependency.py')
+        self.assertNotIn(SECRET, '\n'.join(logs.output))
 
     def test_read_timeout_and_invalid_json_are_distinguishable(self):
         github = review.GitHub(self.config, self.root)
