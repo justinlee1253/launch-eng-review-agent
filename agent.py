@@ -23,6 +23,8 @@ import requests
 
 from auth import AuthRequired, ConfigError, CredentialManager, TemporaryAuthError
 import usage
+import queue_eta
+import messages as chat_messages
 
 
 ROOT = Path(__file__).resolve().parent
@@ -192,6 +194,19 @@ class Store:
         with self.db:
             self.db.execute('insert into model_runs(id,job,started_at,model,effort,service_tier,status,pricing) values(?,?,?,?,?,?,?,?)',
                 (id, job, utc(), usage.MODEL, usage.EFFORT, usage.SERVICE_TIER, 'running', json.dumps(usage.PRICING)))
+            current = self.db.execute("select repo,number,head from jobs where id=? and status='reviewing'", (job,)).fetchone()
+            if current and current['head']:
+                previous = self.db.execute("""select event from ledger where repo=? and number=? and head<>?
+                    and event in ('APPROVED','CHANGES_REQUESTED') order by review_id desc limit 1""",
+                    (current['repo'], current['number'], current['head'])).fetchone()
+                text = queue_eta.started(job)
+                if previous:
+                    verdict = 'approved' if previous['event'] == 'APPROVED' else 'changes requested'
+                    text = f"Back in orbit — re-review started for {current['head'][:8]} (previously {verdict})."
+                for source in self.db.execute('select distinct thread from sources where job=?', (job,)).fetchall():
+                    thread = source['thread']
+                    self._outbox(f"eta:{job}:{current['head']}:{thread}", 'message', thread,
+                        {'text': text + queue_eta.describe(self, job), 'thread': {'name': thread}})
         return id
 
     def end_model_run(self, id, status, tokens):
@@ -275,7 +290,7 @@ class Store:
                 links = pr_links(text)
                 unsupported = [repo for repo, _ in pr_candidates(text) if repo.casefold() not in {r.casefold() for r in REPOS}]
                 if unsupported:
-                    self._outbox('scope:' + name, 'message', thread, {'text': 'Review held — this pilot supports only ROKT/launch-engineering (including Orbit). Other repository links were not queued.', 'thread': {'name': thread}})
+                    self._outbox('scope:' + name, 'message', thread, {'text': 'Not queued — this agent supports ROKT/launch-engineering.\nNext: Post a launch-engineering PR link, or ask an agent maintainer about other repositories.', 'thread': {'name': thread}})
                     self._reaction(name, config.reactions['warning'])
                 wants_stamp = bool(re.search(r'\bSTAMP\b', text, re.IGNORECASE))
                 mode = 'stamp' if wants_stamp else 'review'
@@ -283,13 +298,13 @@ class Store:
                     try:
                         authorized = self.stamp_authorized(sender)
                     except ConfigError as error:
-                        self._outbox('stamp_config:' + name, 'message', thread, {'text': str(error), 'thread': {'name': thread}})
+                        self._outbox('stamp_config:' + name, 'message', thread, {'text': 'STAMP paused — permissions need attention.\nNext: ' + chat_messages.MAINTAINER + ', check the STAMP configuration before another request.', 'thread': {'name': thread}})
                         self._reaction(name, config.reactions['warning'])
                         continue
                     command = re.sub(r'https?://[^\s<>"\x00-\x1f]+', '', text).strip(' \n\r\t:;,<>').casefold()
                     if not authorized or command not in {'stamp', 'stamp for mani'} or not links:
-                        reason = ('STAMP requires explicit permission. Contact Justin Lee (justin.lee@rokt.com) for access, or post without STAMP for a Falcon review.' if not authorized
-                                  else 'Use an actual GitHub PR link followed by STAMP. A folder link does not identify a PR.')
+                        reason = ('STAMP is not enabled for your account.\nNext: Remove STAMP for an Orbit review, or ask an agent maintainer about access.' if not authorized
+                                  else 'STAMP needs a PR link.\nNext: Post a GitHub PR link followed by STAMP; folder links cannot be stamped.')
                         self._outbox('stamp_help:' + name, 'message', thread, {'text': reason, 'thread': {'name': thread}})
                         self._reaction(name, config.reactions['warning'])
                         continue
@@ -302,6 +317,7 @@ class Store:
                                           (repo, number)).fetchone()
                     if job:
                         id = job['id']
+                        original = self.db.execute('select thread,created_at from sources where job=? order by created_at,rowid limit 1', (id,)).fetchone()
                         if job['status'] == 'waiting_ci':
                             self.db.execute('update jobs set ready_after=0 where id=?', (id,))
                     else:
@@ -311,11 +327,12 @@ class Store:
                         self.event('queued', id)
                     self.db.execute('insert into sources values(?,?,?,?,?,?)',
                                     (name, repo, number, thread, msg['createTime'], id))
-                    acknowledgment = 'Received — queued for ' + ('STAMP approval without code review.' if mode == 'stamp' else 'Falcon review.')
+                    acknowledgment = queue_eta.received(id, mode)
                     if first:
-                        acknowledgment = f"Already requested at {first['created_at']}. " + (
-                            'Following the original request; no second review is queued.' if job else
-                            'Checking for a new commit; the same head will reuse the original result without model tokens.')
+                        acknowledgment = chat_messages.duplicate(job, original or first) if job else (
+                            ('STAMP received — checking the latest commit; approval without code review. ' if mode == 'stamp' else
+                             'Re-review request received — checking for a new commit. ') + chat_messages.original_request(first))
+                    acknowledgment += queue_eta.describe(self, id)
                     self._outbox('ack:' + name, 'message', thread,
                                  {'text': acknowledgment, 'thread': {'name': thread}})
                     self._reaction(name, config.reactions['picked_up'])
@@ -343,7 +360,9 @@ class Store:
                             (*values.values(), job['id']))
         job.update(values)
 
-    def finish(self, job, status, text, reaction='warning'):
+    def finish(self, job, status, text, reaction='warning', *, diagnostic=None):
+        if reaction in (None, 'warning') or status in {'waiting_ci', 'needs-attention', 'deferred', 'ambiguous', 'cancelled', 'skipped'}:
+            text = chat_messages.warning(job, status, text, diagnostic=diagnostic)
         emoji = self.reactions[reaction]
         with self.db:
             self.db.execute('update jobs set status=?,result=?,updated_at=? where id=?', (status, text, utc(), job['id']))
@@ -366,6 +385,7 @@ class Store:
                             (job['repo'], job['number'], job['head'], actor, review['id'], review['html_url'], review['state']))
             self.db.execute('update jobs set review_id=?,review_url=?,updated_at=? where id=?',
                             (review['id'], review['html_url'], utc(), job['id']))
+        job.update(review_id=review['id'], review_url=review['html_url'])
 
     def recover(self):
         with self.db:
@@ -438,6 +458,7 @@ class Chat:
         if row['kind'] == 'message':
             if payload.get('thread', {}).get('name') != row['target'] or not row['target'].startswith(self.config.space + '/threads/'):
                 raise ConfigError('Reply must use its original configured-space thread.')
+            payload['markupSyntax'] = 'MARKUP_SYNTAX_CHAT'
             return self.request('POST', self.config.space + '/messages', json=payload,
                 params={'requestId': row['id'], 'messageReplyOption': 'REPLY_MESSAGE_OR_FAIL'})
         return self.request('POST', row['target'] + '/reactions', json=payload)

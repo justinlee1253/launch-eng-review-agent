@@ -192,6 +192,8 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(self.github.submitted), 1)
         self.assertIsNotNone(self.store.reviewed('ROKT/launch-engineering', 6000, HEAD, 'justinlee1253'))
         self.assertTrue(self.store.db.execute("select 1 from events where code='review_stale'").fetchone())
+        self.assertIn('#pullrequestreview-123', job['result'])
+        self.assertNotIn('No review posted', job['result'])
 
     def test_lost_successful_post_response_is_reconciled_without_retry(self):
         self.github.lose_response = True
