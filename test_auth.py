@@ -1,7 +1,11 @@
 import importlib
 import json
+import os
+import stat
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -178,10 +182,10 @@ class AuthTests(unittest.TestCase):
             self.authorize_with(self.manager(store), credentials(scopes=SCOPES[:1], expired=False))
         self.assertIsNone(store.value)
 
-    def test_setup_requests_offline_pkce_and_exact_three_scopes(self):
+    def test_setup_requests_offline_pkce_three_chat_scopes_and_identity(self):
         store = MemoryStore()
         observed = self.authorize_with(self.manager(store), credentials(expired=False))
-        self.assertEqual(set(observed['scopes']), set(SCOPES))
+        self.assertEqual(set(observed['scopes']), set(SCOPES) | {'openid'})
         self.assertEqual(observed['access_type'], 'offline')
         self.assertTrue(observed['autogenerate_code_verifier'])
         self.assertEqual(observed['host'], '127.0.0.1')
@@ -204,7 +208,7 @@ class AuthTests(unittest.TestCase):
                     return credentials(scopes=upgraded, expired=False)
             return Flow()
         manager.authorize(None, reauthorize=True, reaction_updates=True, flow_factory=factory)
-        self.assertEqual(set(observed['scopes']), set(upgraded))
+        self.assertEqual(set(observed['scopes']), set(upgraded) | {'openid'})
         self.assertEqual(endpoint.calls, 1)
         self.assertEqual(manager.status()['status'], 'ready')
         self.assertTrue(self.auth.can_update_reactions(manager.load()))
@@ -222,6 +226,57 @@ class AuthTests(unittest.TestCase):
             manager.authorize(None, reauthorize=True, reaction_updates=True, flow_factory=factory)
         self.assertEqual(store.value, original)
         self.assertFalse(manager.status().get('blocked'))
+    def grant(self, creds):
+        return json.dumps({'project_id': 'le-orbit-review', 'credentials': json.loads(creds.to_json())})
+
+    def test_file_store_seeds_once_from_environment_secret_and_persists_renewal(self):
+        path = self.directory / 'google-grant.json'
+        store = self.auth.FileStore(path)
+        with patch.dict(os.environ, {'GOOGLE_CHAT_GRANT_JSON': self.grant(credentials())}):
+            renewed = self.manager(store).load()
+        self.assertEqual(renewed.token, 'FAKE-renewed-access')
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        with patch.dict(os.environ, {'GOOGLE_CHAT_GRANT_JSON': 'not json at all'}):
+            saved = json.loads(store.get())
+        self.assertEqual(saved['credentials']['token'], 'FAKE-renewed-access')
+        self.assertEqual(saved['credentials']['refresh_token'], 'FAKE-refresh')
+
+    def test_file_store_without_file_or_secret_requires_explicit_setup(self):
+        store = self.auth.FileStore(self.directory / 'google-grant.json')
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('GOOGLE_CHAT_GRANT_JSON', None)
+            self.assertIsNone(store.get())
+            with self.assertRaises(self.auth.AuthRequired):
+                self.manager(store).load()
+            with patch.dict(os.environ, {'GOOGLE_CHAT_GRANT_JSON': '["not", "a", "grant"]'}):
+                with self.assertRaises(self.auth.ConfigError):
+                    store.get()
+        self.assertFalse((self.directory / 'google-grant.json').exists())
+
+    def test_default_store_is_a_runtime_grant_file_off_macos(self):
+        with patch.object(sys, 'platform', 'linux'):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('REVIEW_AGENT_GRANT_FILE', None)
+                store = self.auth.default_store(self.directory)
+                self.assertIsInstance(store, self.auth.FileStore)
+                self.assertEqual(store.path, self.directory / 'google-grant.json')
+            with patch.dict(os.environ, {'REVIEW_AGENT_GRANT_FILE': str(self.directory / 'elsewhere.json')}):
+                self.assertEqual(self.auth.default_store(self.directory).path, self.directory / 'elsewhere.json')
+
+    def test_whoami_needs_identity_scope_and_returns_chat_user_resource(self):
+        with self.assertRaises(self.auth.AuthRequired):
+            self.manager(MemoryStore(credentials(expired=False))).whoami()
+        store = MemoryStore(credentials(scopes=SCOPES + ['openid'], expired=False))
+        calls = []
+
+        def get(url, headers=None, timeout=None):
+            calls.append((url, headers))
+            return type('Response', (), {'status_code': 200, 'json': lambda self: {'sub': '104386993234033491963'}})()
+
+        with patch.object(self.auth.requests, 'get', get):
+            self.assertEqual(self.manager(store).whoami(), 'users/104386993234033491963')
+        self.assertEqual(calls[0][0], 'https://openidconnect.googleapis.com/v1/userinfo')
+        self.assertEqual(calls[0][1]['Authorization'], 'Bearer FAKE-access')
 
     def test_setup_rejects_other_project_before_browser(self):
         path = self.client_file(project_id='unrelated-project')

@@ -24,12 +24,15 @@ import requests
 from auth import AuthRequired, ConfigError, CredentialManager, TemporaryAuthError, can_update_reactions
 import usage
 import queue_eta
+import deployment
 
 
 ROOT = Path(__file__).resolve().parent
-RUNTIME = ROOT / '.runtime'
+RUNTIME = deployment.runtime_path(ROOT)
 REPOS = ('ROKT/launch-engineering',)
 SELF_USER = 'users/104386993234033491963'
+OPERATORS = ('justinlee1253', 'justin-lee_rokt')
+LOGIN = re.compile(r'[A-Za-z0-9_-]{1,39}')
 REACTIONS = {'picked_up': '👀', 'approved': '✅', 'changes_requested': '💬', 'warning': '⚠️'}
 LOG = logging.getLogger('review-agent')
 
@@ -52,6 +55,7 @@ class Config:
     self_user: str = SELF_USER
     poll_seconds: int = 2
     actor: str = 'justinlee1253'
+    operator_logins: tuple = OPERATORS
     context_repositories: tuple = REPOS
     worker_count: int = 1
     reactions: dict = field(default_factory=lambda: dict(REACTIONS))
@@ -62,8 +66,17 @@ class Config:
         timestamp(self.activated_at)
         if type(self.worker_count) is not int or self.worker_count not in (1, 2):
             raise ConfigError('worker_count must be the integer 1 or 2.')
-        if self.poll_seconds != 2 or self.actor != 'justinlee1253' or self.self_user != SELF_USER:
-            raise ConfigError('This pilot uses the agreed two-second interval and Justin identities.')
+        if self.poll_seconds != 2:
+            raise ConfigError('This pilot uses the agreed two-second interval.')
+        if not isinstance(self.actor, str) or not LOGIN.fullmatch(self.actor):
+            raise ConfigError('actor must be the exact GitHub login that submits reviews.')
+        if not isinstance(self.self_user, str) or not re.fullmatch(r'users/[0-9]+', self.self_user):
+            raise ConfigError('self_user must be the Chat user resource (users/ID) of the posting account.')
+        logins = self.operator_logins
+        if (isinstance(logins, str) or not isinstance(logins, (list, tuple)) or not logins
+                or any(not isinstance(v, str) or not LOGIN.fullmatch(v) for v in logins) or self.actor not in logins):
+            raise ConfigError('operator_logins must list GitHub logins and include the actor.')
+        object.__setattr__(self, 'operator_logins', tuple(logins))
         if (not isinstance(self.reactions, dict) or set(self.reactions) != set(REACTIONS)
                 or any(not isinstance(v, str) or not v.strip() or len(v) > 16
                        or any(ord(c) < 32 for c in v) for v in self.reactions.values())):
@@ -680,8 +693,16 @@ def process_lock(path):
 def run(config, directory=RUNTIME):
     from review import GitHub, Reviewer, review_one
     directory = Path(directory)
+    try:
+        deployment.guard(directory, required=bool(os.environ.get('REVIEW_AGENT_RUNTIME')))
+    except deployment.DeploymentError as error:
+        raise ConfigError(str(error)) from None
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with process_lock(directory / 'worker.lock'):
+        try:
+            deployment.guard(directory, required=bool(os.environ.get('REVIEW_AGENT_RUNTIME')))
+        except deployment.DeploymentError as error:
+            raise ConfigError(str(error)) from None
         store = Store(directory / 'state.sqlite3', config.reactions)
         store.import_previous()
         store.recover()
@@ -770,6 +791,11 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
     setup = commands.add_parser('configure')
     setup.add_argument('--space', required=True, help='Exact spaces/ID or Google Chat URL')
+    setup.add_argument('--actor', default='justinlee1253', help='GitHub login that submits reviews')
+    setup.add_argument('--self-user', default=SELF_USER,
+                       help='Chat user resource (users/ID) of the posting Google account; see auth.py whoami')
+    setup.add_argument('--operator', action='append', default=None,
+                       help='Additional GitHub login whose PRs and reviews count as the operator (repeatable)')
     commands.add_parser('run')
     commands.add_parser('status')
     commands.add_parser('history')
@@ -788,7 +814,10 @@ def main():
                 if url.netloc != 'chat.google.com' or not match:
                     raise ConfigError('Use the exact dedicated space URL.')
                 value = 'spaces/' + match[1]
-            config = Config(value, utc())
+            operators = tuple(args.operator or ()) or (OPERATORS if args.actor == 'justinlee1253' else ())
+            if args.actor not in operators:
+                operators = (args.actor,) + operators
+            config = Config(value, utc(), self_user=args.self_user, actor=args.actor, operator_logins=operators)
             RUNTIME.mkdir(mode=0o700, exist_ok=True)
             path = RUNTIME / 'config.json'
             if path.exists():
@@ -797,6 +826,10 @@ def main():
             print('Configured ' + config.space + '; no background process was started.')
             return 0
         config = Config.load()
+        try:
+            deployment.guard(RUNTIME, required=bool(os.environ.get('REVIEW_AGENT_RUNTIME')))
+        except deployment.DeploymentError as error:
+            raise ConfigError(str(error)) from None
         if args.command == 'run':
             run(config)
             return 0
