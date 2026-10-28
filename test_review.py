@@ -132,6 +132,22 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.github.submitted, [])
         self.assertEqual(self.store.history()[0]['status'], 'needs-attention')
 
+    def test_configured_operator_identity_governs_submission_and_self_exclusion(self):
+        config = Config(SPACE, START, self_user='users/42', actor='reviewer_rokt', operator_logins=['reviewer_rokt'])
+        self.github.login = 'reviewer_rokt'
+        review.review_one(config, self.store, self.github, Reviewer(), self.job)
+        self.assertEqual(self.store.history()[0]['status'], 'submitted')
+        self.assertIsNotNone(self.store.reviewed('ROKT/launch-engineering', 6000, HEAD, 'reviewer_rokt'))
+        self.assertIsNone(self.store.reviewed('ROKT/launch-engineering', 6000, HEAD, 'justinlee1253'))
+        self.github.submitted.clear()
+        self.github.data['user'] = {'login': 'reviewer_rokt'}
+        self.store.ingest(config, [message(id='two', createTime='2026-10-26T18:53:00Z')], START, END, None)
+        job = self.store.claim()
+        review.review_one(config, self.store, self.github, Reviewer(), job)
+        self.assertEqual(self.github.submitted, [])
+        self.assertEqual(self.store.history()[0]['status'], 'skipped')
+        self.assertIn('self-approval is excluded', self.store.history()[0]['result'])
+
     def test_wrong_identity_cannot_submit(self):
         self.github.login = 'justin-lee_rokt'
         self.assertEqual(self.run_review()['status'], 'needs-attention')

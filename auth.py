@@ -1,4 +1,4 @@
-"""Explicit Google setup and silent renewal; grants live only in macOS Keychain."""
+"""Explicit Google setup and silent renewal; grants live in macOS Keychain or an owner-only grant file."""
 
 import argparse
 import contextlib
@@ -7,6 +7,7 @@ import functools
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -17,10 +18,16 @@ from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+import requests
 
 
-PROJECT_ID = 'le-orbit-review'
-ACCOUNT = 'justin.lee@rokt.com'
+# Both default to the pilot identity; a different deployment overrides them in its environment.
+PROJECT_ID = os.environ.get('REVIEW_AGENT_GOOGLE_PROJECT') or 'le-orbit-review'
+ACCOUNT = os.environ.get('REVIEW_AGENT_GOOGLE_ACCOUNT') or 'justin.lee@rokt.com'
+GRANT_ENV = 'GOOGLE_CHAT_GRANT_JSON'
+GRANT_FILE_ENV = 'REVIEW_AGENT_GRANT_FILE'
+IDENTITY_SCOPE = 'openid'
+USERINFO_URI = 'https://openidconnect.googleapis.com/v1/userinfo'
 SERVICE = 'com.rokt.le-orbit-review.google-chat'
 TOKEN_URI = 'https://oauth2.googleapis.com/token'
 SCOPES = [
@@ -64,12 +71,67 @@ class KeychainStore:
             raise ConfigError('The grant could not be verified in macOS Keychain.') from None
 
 
+class FileStore:
+    """Owner-only grant file for hosts without Keychain; seeded once from an environment secret."""
+
+    def __init__(self, path, seed_env=GRANT_ENV):
+        self.path = Path(path)
+        self.seed_env = seed_env
+
+    def get(self):
+        try:
+            if self.path.exists():
+                return self.path.read_text()
+        except OSError:
+            raise ConfigError('The grant file could not be read; no login was started.') from None
+        seed = os.environ.get(self.seed_env, '').strip()
+        if not seed:
+            return None
+        try:
+            if not isinstance(json.loads(seed), dict):
+                raise ValueError()
+        except ValueError:
+            raise ConfigError('The ' + self.seed_env + ' environment secret is not an exported grant.') from None
+        self.set(seed)
+        return seed
+
+    def set(self, value):
+        temp = None
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd, temp = tempfile.mkstemp(dir=self.path.parent, prefix='.grant-')
+            with os.fdopen(fd, 'w') as output:
+                output.write(value)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temp, 0o600)
+            os.replace(temp, self.path)
+            temp = None
+            if self.path.read_text() != value:
+                raise ValueError('Grant file verification failed')
+        except (OSError, ValueError):
+            raise ConfigError('The grant could not be verified in the grant file.') from None
+        finally:
+            if temp and os.path.exists(temp):
+                os.unlink(temp)
+
+
+def default_store(directory):
+    """Keychain on macOS; otherwise an owner-only file under the runtime directory."""
+    override = os.environ.get(GRANT_FILE_ENV)
+    if override:
+        return FileStore(Path(override).expanduser())
+    if sys.platform == 'darwin':
+        return KeychainStore()
+    return FileStore(Path(directory) / 'google-grant.json')
+
+
 class CredentialManager:
     def __init__(self, store=None, state_dir=None, request_factory=None):
-        self.store = store if store is not None else KeychainStore()
         self.directory = Path(state_dir) if state_dir else Path(__file__).parent / '.runtime'
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.directory.chmod(0o700)
+        self.store = store if store is not None else default_store(self.directory)
         self.state_file = self.directory / 'auth-state.json'
         self.request_factory = request_factory or (lambda: functools.partial(Request(), timeout=20))
 
@@ -192,14 +254,15 @@ class CredentialManager:
             if self.store.get() and not reauthorize:
                 raise AuthRequired('A grant already exists. Use check; explicit repair uses --reauthorize.')
             factory = flow_factory or InstalledAppFlow.from_client_config
-            flow = factory(config, scopes=SCOPES, autogenerate_code_verifier=True)
+            # The identity scope only lets whoami resolve the Chat user resource of this account.
+            flow = factory(config, scopes=SCOPES + [IDENTITY_SCOPE], autogenerate_code_verifier=True)
             # The SDK callback URL contains a short-lived code; keep it out of logs.
             logging.getLogger('google_auth_oauthlib').setLevel(logging.CRITICAL)
             try:
                 creds = flow.run_local_server(
                     host='127.0.0.1', port=0, timeout_seconds=300,
                     open_browser=True, authorization_prompt_message=None,
-                    success_message='Authorization received. Return to Codex to verify secure storage and renewal.',
+                    success_message='Authorization received. Return to the terminal to verify storage and renewal.',
                     access_type='offline', prompt='consent',
                     login_hint=ACCOUNT, hd='rokt.com',
                 )
@@ -208,6 +271,25 @@ class CredentialManager:
             self._save(creds)
             self._state('authorized_refresh_unverified', creds=creds)
 
+    def whoami(self):
+        """Resolve the Chat user resource (users/ID) of the granted account; never opens a browser."""
+        creds = self.load()
+        if IDENTITY_SCOPE not in set(creds.granted_scopes or creds.scopes or []):
+            raise AuthRequired('The grant has no identity scope; authorize again with --reauthorize before whoami.')
+        try:
+            response = requests.get(USERINFO_URI, headers={'Authorization': 'Bearer ' + creds.token}, timeout=20)
+        except requests.RequestException:
+            raise TemporaryAuthError('Google could not be reached; identity lookup skipped.') from None
+        if response.status_code != 200:
+            raise TemporaryAuthError('Identity lookup failed (HTTP ' + str(response.status_code) + ').')
+        try:
+            sub = str(response.json().get('sub', ''))
+        except ValueError:
+            sub = ''
+        if not re.fullmatch(r'[0-9]{5,40}', sub):
+            raise TemporaryAuthError('Identity lookup returned no user id.')
+        return 'users/' + sub
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -215,20 +297,23 @@ def main():
     setup = commands.add_parser('authorize', help='Explicit one-time browser authorization')
     setup.add_argument('--client-file', required=True)
     setup.add_argument('--reauthorize', action='store_true', help='Explicitly replace an existing grant')
-    check = commands.add_parser('check', help='Load Keychain credentials without any browser login')
+    check = commands.add_parser('check', help='Load the stored grant without any browser login')
     check.add_argument('--force-refresh', action='store_true')
     commands.add_parser('status', help='Show only non-secret local authentication health')
+    commands.add_parser('whoami', help='Print the Chat user resource (users/ID) for configure --self-user')
     args = parser.parse_args()
     try:
         manager = CredentialManager()
         if args.command == 'authorize':
-            print('Opening one Google authorization window. Choose justin.lee@rokt.com.', flush=True)
+            print('Opening one Google authorization window. Choose ' + ACCOUNT + '.', flush=True)
             manager.authorize(args.client_file, reauthorize=args.reauthorize)
-            print('Grant verified in macOS Keychain. Run check --force-refresh to test renewal.', flush=True)
+            print('Grant stored and verified. Run check --force-refresh to test renewal.', flush=True)
         elif args.command == 'check':
             manager.load(force_refresh=args.force_refresh)
-            print('Keychain grant loaded; required scopes present. No browser login was used.')
+            print('Stored grant loaded; required scopes present. No browser login was used.')
             print(json.dumps(manager.status(), indent=2))
+        elif args.command == 'whoami':
+            print(manager.whoami())
         else:
             print(json.dumps(manager.status(), indent=2))
         return 0

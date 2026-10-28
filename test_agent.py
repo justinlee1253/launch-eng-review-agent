@@ -101,6 +101,24 @@ class IntakeTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("select count(*) from events where code='authorization_invalid'").fetchone()[0], 1)
         self.assertIsNone(self.store.meta('checkpoint'))
 
+    def test_config_accepts_a_different_operator_identity_from_json_lists(self):
+        config = agent.Config(SPACE, START, self_user='users/42', actor='reviewer_rokt',
+                              operator_logins=['reviewer_rokt', 'reviewer-personal'])
+        self.assertEqual(config.operator_logins, ('reviewer_rokt', 'reviewer-personal'))
+        self.assertEqual(agent.Config(SPACE, START).operator_logins, agent.OPERATORS)
+
+    def test_config_rejects_inconsistent_or_malformed_identities(self):
+        for changes in [{'actor': 'reviewer_rokt'},
+                        {'actor': 'reviewer_rokt', 'operator_logins': ['someone-else']},
+                        {'actor': 'bad login', 'operator_logins': ['bad login']},
+                        {'self_user': 'reviewer@rokt.com'},
+                        {'operator_logins': []},
+                        {'operator_logins': 'justinlee1253'},
+                        {'poll_seconds': 5}]:
+            with self.subTest(changes=changes):
+                with self.assertRaises(agent.ConfigError):
+                    agent.Config(SPACE, START, **changes)
+
     def test_single_process_lock_rejects_second_instance(self):
         with agent.process_lock(Path(self.tmp.name) / 'worker.lock'):
             with self.assertRaises(agent.ConfigError):
