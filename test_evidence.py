@@ -27,9 +27,6 @@ class Remote(GitHub):
         self.mode = '100644'
         self.file_count = 1
 
-    def local_context(self, repo):
-        return {}
-
     def api(self, endpoint, payload=None):
         self.calls.append(endpoint)
         if '/compare/' in endpoint:
@@ -100,6 +97,21 @@ class EvidenceTests(unittest.TestCase):
         with patch('review.subprocess.run', side_effect=AssertionError('Out-of-scope CLI call')):
             with self.assertRaises(Incomplete):
                 github.api('repos/ROKT/catalog')
+
+    def test_missing_requested_file_and_directory_are_reported_as_unavailable(self):
+        evidence = Evidence('ROKT/launch-engineering', HEAD, BASE, BASE)
+        evidence.fulfill(self.github, [
+            dict(repo=evidence.repo, ref='head', kind='file', path='docs/missing-plan.md'),
+            dict(repo=evidence.repo, ref='head', kind='tree', path='docs/missing-directory')])
+        documents = evidence.as_dict()['documents']
+        self.assertIsNone(documents['ROKT/launch-engineering@' + HEAD + ':docs/missing-plan.md'])
+        self.assertIsNone(documents['ROKT/launch-engineering@' + HEAD + ':docs/missing-directory/DIRECTORY'])
+
+    def test_missing_required_source_cannot_reuse_an_optional_absence(self):
+        evidence = Evidence('ROKT/launch-engineering', HEAD, BASE, BASE)
+        evidence.read(self.github, evidence.repo, HEAD, 'missing.py', optional=True)
+        with self.assertRaises(Incomplete):
+            evidence.read(self.github, evidence.repo, HEAD, 'missing.py')
 
     def test_approved_main_is_pinned_for_all_evidence_rounds(self):
         evidence = Evidence('ROKT/launch-engineering', HEAD, BASE, BASE)

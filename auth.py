@@ -28,6 +28,12 @@ SCOPES = [
     'https://www.googleapis.com/auth/chat.messages.create',
     'https://www.googleapis.com/auth/chat.messages.reactions.create',
 ]
+REACTION_SCOPE = 'https://www.googleapis.com/auth/chat.messages.reactions'
+
+
+def can_update_reactions(creds):
+    scopes = creds.granted_scopes if creds.granted_scopes is not None else creds.scopes
+    return bool({REACTION_SCOPE, 'https://www.googleapis.com/auth/chat.messages'} & set(scopes or []))
 
 
 class AuthRequired(Exception):
@@ -100,6 +106,8 @@ class CredentialManager:
             state['reason'] = reason
         if creds and creds.expiry:
             state['access_token_expires_at'] = creds.expiry.isoformat() + 'Z'
+        if creds:
+            state['reaction_updates_enabled'] = can_update_reactions(creds)
         if status == 'ready':
             state['refresh_verified_at'] = now
         fd, temp = tempfile.mkstemp(dir=self.directory, prefix='.auth-state-')
@@ -122,7 +130,8 @@ class CredentialManager:
         if not creds.refresh_token:
             raise AuthRequired('No refresh token was received; unattended setup is incomplete.')
         granted = creds.granted_scopes if creds.granted_scopes is not None else creds.scopes
-        if not set(SCOPES).issubset(set(granted or [])):
+        if (not set(SCOPES[:2]).issubset(set(granted or []))
+                or not (SCOPES[2] in set(granted or []) or can_update_reactions(creds))):
             raise AuthRequired('Not all three required Chat permissions were granted.')
 
     def _save(self, creds):
@@ -173,13 +182,20 @@ class CredentialManager:
                 self._state('ready', creds=creds)
             return creds
 
-    def authorize(self, client_file, *, reauthorize=False, flow_factory=None):
+    def authorize(self, client_file, *, reauthorize=False, reaction_updates=False, flow_factory=None):
         """The only interactive entry point; called deliberately during setup."""
         try:
-            path = Path(client_file).expanduser()
-            if path.stat().st_size > 65536:
-                raise ValueError()
-            config = json.loads(path.read_text())
+            if client_file is None and reaction_updates:
+                record = json.loads(self.store.get() or '{}')
+                info = record['credentials']
+                config = {'installed': {'project_id': record['project_id'], 'client_id': info['client_id'],
+                    'client_secret': info['client_secret'], 'token_uri': info['token_uri'],
+                    'auth_uri': 'https://accounts.google.com/o/oauth2/auth'}}
+            else:
+                path = Path(client_file).expanduser()
+                if path.stat().st_size > 65536:
+                    raise ValueError()
+                config = json.loads(path.read_text())
             client = config['installed']
             endpoint = urlsplit(client['auth_uri'])
             if (client['project_id'] != PROJECT_ID or not client.get('client_id')
@@ -192,7 +208,8 @@ class CredentialManager:
             if self.store.get() and not reauthorize:
                 raise AuthRequired('A grant already exists. Use check; explicit repair uses --reauthorize.')
             factory = flow_factory or InstalledAppFlow.from_client_config
-            flow = factory(config, scopes=SCOPES, autogenerate_code_verifier=True)
+            scopes = SCOPES[:2] + [REACTION_SCOPE] if reaction_updates else SCOPES
+            flow = factory(config, scopes=scopes, autogenerate_code_verifier=True)
             # The SDK callback URL contains a short-lived code; keep it out of logs.
             logging.getLogger('google_auth_oauthlib').setLevel(logging.CRITICAL)
             try:
@@ -205,15 +222,26 @@ class CredentialManager:
                 )
             except Exception:
                 raise AuthRequired('Initial authorization did not finish. No automatic login retry will occur.') from None
+            self._validate_grant(creds)
+            if reaction_updates:
+                if not can_update_reactions(creds):
+                    raise AuthRequired('Reaction replacement permission was not granted; the saved grant was retained.')
+                try:
+                    creds.refresh(self.request_factory())
+                except (TransportError, RefreshError):
+                    raise TemporaryAuthError('New grant renewal could not be verified; the saved grant was retained.') from None
+                if not can_update_reactions(creds):
+                    raise AuthRequired('Renewed grant lacks reaction replacement permission; the saved grant was retained.')
             self._save(creds)
-            self._state('authorized_refresh_unverified', creds=creds)
+            self._state('ready' if reaction_updates else 'authorized_refresh_unverified', creds=creds)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     setup = commands.add_parser('authorize', help='Explicit one-time browser authorization')
-    setup.add_argument('--client-file', required=True)
+    setup.add_argument('--client-file')
+    setup.add_argument('--reaction-updates', action='store_true', help='Explicit permission upgrade using the existing Keychain client; verifies renewal')
     setup.add_argument('--reauthorize', action='store_true', help='Explicitly replace an existing grant')
     check = commands.add_parser('check', help='Load Keychain credentials without any browser login')
     check.add_argument('--force-refresh', action='store_true')
@@ -222,9 +250,13 @@ def main():
     try:
         manager = CredentialManager()
         if args.command == 'authorize':
+            if not args.client_file and not args.reaction_updates:
+                raise ConfigError('Initial setup requires --client-file; --reaction-updates reuses an existing saved client.')
             print('Opening one Google authorization window. Choose justin.lee@rokt.com.', flush=True)
-            manager.authorize(args.client_file, reauthorize=args.reauthorize)
-            print('Grant verified in macOS Keychain. Run check --force-refresh to test renewal.', flush=True)
+            manager.authorize(args.client_file, reauthorize=args.reauthorize or args.reaction_updates,
+                              reaction_updates=args.reaction_updates)
+            print('Reaction permission and silent renewal verified in Keychain.' if args.reaction_updates else
+                  'Grant verified in macOS Keychain. Run check --force-refresh to test renewal.', flush=True)
         elif args.command == 'check':
             manager.load(force_refresh=args.force_refresh)
             print('Keychain grant loaded; required scopes present. No browser login was used.')
