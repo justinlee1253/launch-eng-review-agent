@@ -4,6 +4,54 @@ ad-sentinel is an aiohttp service on EKS that receives Datadog anomaly webhooks 
 
 Its written rules are `ad-sentinel/AGENTS.md` (P0 and P1 review severities), `README.md` and `docs/testing.md`. There is no `ad-sentinel/CLAUDE.md`; judge the trajectory against the shape the code already has. `service_profiles["ad-sentinel"].loaded_docs` lists the context files in `documents`. `deferred_docs` lists files the budget left out. `withheld_docs` lists files that hold credential values: request one only when a finding depends on it, and never quote the value (section 12). Map `AGENTS.md` P0 to `dangerous` and P1 to `should_fix`, blocking. Start the title with `Sentinel rule:`.
 
+## Architecture map
+
+The README diagram is an image, so this is the text map. Prefix paths with `ad-sentinel/ad_sentinel/`. Request a module at `ref=head` to verify a boundary before you judge it.
+
+- Entry points (`app.py`):
+  - `POST /webhooks/v1/datadog-webhook`: account anomaly alerts, queued to `process_alerts.process_datadog_alert`.
+  - `POST /webhooks/v1/new-datadog-webhook`: SMB and group monitors, to `group_monitors/datadog_webhook.handle_datadog_event`.
+  - `POST /detector/notify`: detector events, to `detector/detector_event_controller.handle_detector_event`.
+  - `POST /categorize` and `GET /categorize/issues`: issue categorization, in `categorization/`.
+  - `GET /killswitch?suppress=N`: sets or clears the killswitch (`models/killswitch.py`).
+  - `GET /app_health/v1/__heartbeat__`: health.
+- Work runs on one bounded queue: 20 workers, 200 pending jobs (`MAX_WORKERS`, `MAX_PENDING_JOBS`). A handler that does slow work outside the queue blocks the event loop.
+- Account alert path, in order, in `controllers/process_alerts.py`:
+  1. Validate.
+  2. Check the killswitch.
+  3. Enrich the account (`models/alert.set_account_values`, using Trino, StarRocks and ClickHouse).
+  4. Run `sanity_check`. In order, it checks:
+     - monitor and metric exclusions
+     - upsell
+     - ADMC liveness
+     - test account
+     - live resource, Rokt-managed account, Aftersell page and SMB segment (these four in `controllers/suppression.py`)
+     - genuine trigger
+     - superset alarm
+     - active page variants or campaigns
+     - the hourly cap
+  5. Notify (`controllers/notification.py`).
+  6. Save to the database (`models/alert.save_to_db`), unless the alert is a trial.
+  7. Hand off to `account_alert_service.process_alert_dd` for Jira tickets, tags, product type and auto-close.
+- Group monitor path: `group_monitors/datadog_webhook.py` saves the event, then posts one Chat message. It has its own template and space.
+- Detector path: `detector/detector_event_controller.py` runs three steps:
+  1. Save the event.
+  2. Pick the channels (`detector_event_checker.py`).
+  3. Dedupe by detector window (`detector_event_suppressor.py`).
+
+  It then sends through `channels/` (Jira and Chat clients, built by `channels/channel_factory.py`). Dev uses mocks.
+- Data ownership:
+  - ad-sentinel owns the `sentinel` schema in Postgres (alert log, Jira ticket links, killswitch, detector events, recipients), through `controllers/db.py` and `sql/queries/pg_*.sql`.
+  - It reads, but does not own, ClickHouse, StarRocks and Trino (`clickhouse.py`, `starrocks.py`, `trino_db.py`, `sql/queries/{ch,sr,trino}_dictionary.sql`).
+- Downstream writes:
+  - Jira (`controllers/jira_operations.py`, `channels/jira_*`).
+  - Google Chat (`controllers/gchat.py`, `channels/gchat_*`).
+  - Email through op3-notifications (`notification.py`).
+  - Datadog metrics (`controllers/dogstatsd.py`).
+  - Reads from the Rokt platform, transactions and supplementals APIs (`controllers/rokt_api.py`, `controllers/supplementals.py`).
+
+A change on one path is checked against the safety steps of that path. A new path is checked against all of them (items 5 to 12).
+
 ## Data access
 
 1. SQL takes values as bound parameters: `text(query)` with `:name` placeholders and a params dict, as `alert_baseline.py` does. A value that this PR puts into SQL text through a `{{ }}` template value, an f-string, `%` or `.format`: `dangerous` (`AGENTS.md` P0). Values come from webhook payloads. Unchanged lines are not findings.
