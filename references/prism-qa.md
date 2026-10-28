@@ -2,7 +2,7 @@
 
 Prism QA is a macOS SwiftUI app for Launch Engineering QA. It runs a local `mitmdump` proxy, captures Rokt and mParticle traffic, records evidence on the operator's Mac, and shares runs to Google Drive, Sheets, Jira, Google Chat and an n8n webhook. It ships by hand as a signed, notarized build through a Homebrew cask. Telemetry goes to `prism-pulse`.
 
-Its rules live in `prism-qa/CLAUDE.md` (decision log and hygiene) and the topic docs under `prism-qa/.claude/`. `service_profiles["prism-qa"].loaded_docs` lists the docs in `documents`. `deferred_docs` lists topic docs that the budget left out: request one with `kind=file`, `ref=head` when a finding depends on it. `prism-qa/.claude/prism_dev_context.md` is only an index. Cite the doc line when you enforce a rule. Start the title with `Prism rule:`.
+Its rules live in `prism-qa/CLAUDE.md` (decision log and hygiene) and the topic docs under `prism-qa/.claude/`. `service_profiles["prism-qa"].loaded_docs` lists the docs in `documents`. `deferred_docs` lists docs that the budget left out: request one with `kind=file`, `ref=head` when a finding depends on it. `unavailable_docs` lists docs the host could not read as text (over 250 KB, binary or unverifiable); do not request them. `prism-qa/.claude/prism_dev_context.md` is only an index. Cite the doc line when you enforce a rule. Start the title with `Prism rule:`.
 
 ## Telemetry and the Pulse token
 
@@ -38,7 +38,7 @@ Its rules live in `prism-qa/CLAUDE.md` (decision log and hygiene) and the topic 
 18. `verify-artifact.sh` checks the artifact sha256 against `release-manifest.json`. A change that skips or weakens that check: `dangerous`.
 19. `latest.json` is published only for the version the cask already names. A change that publishes it before the cask and the artifact agree: `should_fix`, blocking. A stale or early `latest.json` hides or breaks the update banner.
 20. The cask has no `depends_on mitmproxy`, and its `zap` stanza never names `~/Desktop/prism_qa`. A `zap` path that deletes audit data: `dangerous`.
-21. A version bump changes `project.yml` and the minimum pins in `release-requirements.json` together. One without the other: `should_fix`, non-blocking.
+21. `scripts/check-release-source.py` is the release contract: `MARKETING_VERSION` in `project.yml` is at least `minimum_version` in `release-requirements.json`, and every `required_changes` commit is an ancestor of the release commit. A patch release that keeps the existing pins is normal and not a finding. A change that removes a required change, lowers `minimum_version`, or weakens the checker: `should_fix`, blocking.
 
 ## Background
 

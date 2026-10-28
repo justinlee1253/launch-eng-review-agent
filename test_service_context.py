@@ -86,6 +86,44 @@ class ServiceContextTests(unittest.TestCase):
         self.assertEqual(profile['deferred_docs'], ['prism-qa/.claude/prism_telemetry.md'])
         self.assertNotIn('ROKT/launch-engineering@' + HEAD + ':prism-qa/.claude/prism_telemetry.md', evidence.documents)
 
+    def test_oversized_mapped_doc_is_unavailable_and_small_pr_still_captures(self):
+        remote = Remote(self.root, path=TELEMETRY)
+        remote.source[(HEAD, 'prism-qa/.claude/prism_overview.md')] = 'overview-marker'
+        original = remote.file
+        def file(repo, sha, path, *, optional=False):
+            if path == 'prism-qa/.claude/prism_telemetry.md':
+                raise review.Incomplete('File is binary, too large, or is not a regular file: ' + path)
+            return original(repo, sha, path, optional=optional)
+        remote.file = file
+        evidence = remote.capture({'repo': 'ROKT/launch-engineering', 'number': 6000}, remote.data)
+        profile = evidence.services['prism-qa']
+        self.assertEqual(profile['unavailable_docs'], ['prism-qa/.claude/prism_telemetry.md'])
+        self.assertIn('prism-qa/.claude/prism_overview.md', profile['loaded_docs'])
+        self.assertIn('ROKT/launch-engineering@' + HEAD + ':' + TELEMETRY, evidence.documents)
+
+    def test_changed_file_that_cannot_be_read_still_holds_the_review(self):
+        remote = Remote(self.root, path=TELEMETRY)
+        original = remote.file
+        def file(repo, sha, path, *, optional=False):
+            if path == TELEMETRY:
+                raise review.Incomplete('File is binary, too large, or is not a regular file: ' + path)
+            return original(repo, sha, path, optional=optional)
+        remote.file = file
+        with self.assertRaises(review.Incomplete):
+            remote.capture({'repo': 'ROKT/launch-engineering', 'number': 6000}, remote.data)
+
+    def test_escaped_and_unicode_doc_is_measured_as_serialized(self):
+        # 240,000 characters pass a raw-length check but serialize to 1,280,000, past the hard limit.
+        heavy = ('é' * 5 + '"') * 40_000
+        self.assertLess(len(heavy), review.MAX_CONTEXT - service_context.HEADROOM)
+        self.assertGreater(len(json.dumps(heavy)), review.MAX_CONTEXT)
+        _, evidence = self.capture(docs={(HEAD, 'prism-qa/.claude/prism_overview.md'): 'overview-marker',
+                                         (HEAD, 'prism-qa/.claude/prism_telemetry.md'): heavy})
+        profile = evidence.services['prism-qa']
+        self.assertEqual(profile['deferred_docs'], ['prism-qa/.claude/prism_telemetry.md'])
+        self.assertNotIn('prism-qa/.claude/prism_telemetry.md', profile['loaded_docs'])
+        self.assertLessEqual(evidence.size(), review.MAX_CONTEXT - service_context.HEADROOM)
+
     def test_baseline_doc_falls_back_to_merge_base(self):
         _, evidence = self.capture(docs={(BASE, 'prism-qa/.claude/prism_overview.md'): 'base-overview'})
         self.assertEqual(evidence.documents['ROKT/launch-engineering@' + BASE + ':prism-qa/.claude/prism_overview.md'],

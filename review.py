@@ -280,6 +280,13 @@ class GitHub:
         except (KeyError, ValueError, UnicodeError):
             raise Incomplete('Complete UTF-8 blob could not be verified: ' + path) from None
 
+    def context_file(self, repo, sha, path):
+        """Optional background text: None when absent, False when it cannot be used as text evidence."""
+        try:
+            return self.file(repo, sha, path, optional=True)
+        except Incomplete:
+            return False
+
     def directory_entries(self, repo, sha, path=''):
         check_sha(sha)
         safe_path(path, root=True)

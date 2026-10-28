@@ -120,9 +120,11 @@ context, not proof that a proposal is merged or deployed.
 Other services get a profile in [service_context.py](service_context.py), selected the same
 way by path (`prism-qa/` today). A profile adds the service's review reference from
 [references/](references) and its own docs from the repository at the captured head: a small
-baseline, plus the topic docs whose code the PR changes. Topic docs that would leave less than
-400,000 characters of context budget are listed as `deferred_docs` for the model to request
-instead of holding the review. A missing bundled reference holds the review. The reference is
+baseline, plus the topic docs whose code the PR changes. A doc is admitted by its serialized
+cost; one that would leave less than 400,000 characters of context budget is listed as
+`deferred_docs` for the model to request instead of holding the review. A doc that cannot be
+read as text (over 250 KB, binary or unverifiable) is listed as `unavailable_docs`; only a
+changed file that cannot be read holds the review. A missing bundled reference holds the review. The reference is
 versioned with this repository, so its hash in the context audit identifies the rules applied.
 
 A necessary companion PR can be read with `ref=pr/NUMBER`; its head is pinned and its

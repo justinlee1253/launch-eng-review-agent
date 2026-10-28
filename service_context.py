@@ -119,7 +119,7 @@ def topics(service, paths):
 
 
 def load(evidence, github, service, affected, limit):
-    """Attach the service reference and its docs; topic docs past the headroom are left for the model to request."""
+    """Attach the service reference and its docs; docs past the headroom are left for the model to request."""
     profile = PROFILES[service]
     path = REFERENCES / profile['reference']
     if path.is_symlink():
@@ -129,25 +129,28 @@ def load(evidence, github, service, affected, limit):
         {'path': str(path), 'kind': 'review_reference', 'sha256': hashlib.sha256(text.encode()).hexdigest(),
          'compiled_sha': None, 'freshness': 'unversioned'}]
     evidence.references[service] = text
-    loaded, deferred = [], []
-    for doc in profile['baseline']:
-        _read(evidence, github, doc)
-        loaded.append(doc)
-    for doc in topics(service, affected):
-        if doc in loaded:
+    loaded, deferred, unavailable = [], [], []
+    evidence.services[service] = {'affected_paths': affected, 'loaded_docs': loaded,
+                                  'deferred_docs': deferred, 'unavailable_docs': unavailable}
+    baseline = tuple(profile['baseline'])
+    for doc in baseline + tuple(doc for doc in topics(service, affected) if doc not in baseline):
+        # Baseline docs fall back to the merge base; topic docs describe the code at head only.
+        for sha in (evidence.head, evidence.ancestor) if doc in baseline else (evidence.head,):
+            key = evidence.repo + '@' + sha + ':' + doc
+            known = key in evidence.documents
+            text = evidence.documents[key] if known else github.context_file(evidence.repo, sha, doc)
+            if text is not None:
+                break
+        if text is False:
+            unavailable.append(doc)
             continue
-        key = evidence.repo + '@' + evidence.head + ':' + doc
-        if key not in evidence.documents:
-            text = github.file(evidence.repo, evidence.head, doc, optional=True)
-            if text is not None and evidence.size() + len(text) > limit - HEADROOM:
-                deferred.append(doc)
-                continue
-            evidence.documents[key] = text
         loaded.append(doc)
-    evidence.services[service] = {'affected_paths': affected, 'loaded_docs': loaded, 'deferred_docs': deferred}
+        if known:
+            continue
+        evidence.documents[key] = text
+        # Admission is measured as serialized evidence, so escapes and non-ASCII text count at full cost.
+        if text is not None and evidence.size() > limit - HEADROOM:
+            del evidence.documents[key]
+            loaded.pop()
+            deferred.append(doc)
     evidence.check_budget()
-
-
-def _read(evidence, github, path):
-    if evidence.read(github, evidence.repo, evidence.head, path, optional=True) is None:
-        evidence.read(github, evidence.repo, evidence.ancestor, path, optional=True)
