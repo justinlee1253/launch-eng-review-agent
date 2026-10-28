@@ -41,7 +41,6 @@
     "reviewed_documents": {
       "type": "array",
       "items": {"type": "string"},
-      "uniqueItems": true,
       "description": "Exact document and document_aliases keys actually reviewed, including reconstructed sources. Do not acknowledge documents only received but not reviewed."
     },
     "lenses": {
