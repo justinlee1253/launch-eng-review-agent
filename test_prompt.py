@@ -44,16 +44,22 @@ class PromptTests(unittest.TestCase):
             prompts.append(prompt)
             self.assertLessEqual(len(prompt), 1_048_576)
             if len(prompts) == 1:
-                return {'status': 'needs_evidence', 'requests': [
-                    {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'duplicate.py'}]}
-            return result()
+                return result(status='needs_evidence', progress='Check the newly requested source identity.',
+                    reviewed_documents=list(self.evidence.documents), requests=[
+                    {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'duplicate.py'}])
+            data = self.prompt_data(prompt)
+            return result(reviewed_documents=list(data['documents']) + list(data.get('document_aliases', {})), finding_decisions=[])
 
         self.reviewer.invoke = invoke
         self.reviewer.review(self.github, self.evidence)
         data = self.prompt_data(prompts[1])
-        restored = dict(data['documents'])
-        for key, target in data['document_aliases'].items():
-            restored[key] = data['documents'][target]
+        restored = {}
+        for prompt in prompts:
+            part = self.prompt_data(prompt)
+            restored.update(part['documents'])
+            for key, target in part['document_aliases'].items():
+                restored[key] = part['documents'][target]
+        self.assertNotIn(f'{self.evidence.repo}@{HEAD}:large0.py', list(data['documents']))
         self.assertEqual(restored, {**original, duplicate: '0' * 215_000})
         self.assertEqual(self.evidence.documents, restored)
         self.assertEqual(data['complete_diff'], self.evidence.diff)

@@ -78,8 +78,8 @@ class LargePromptTests(unittest.TestCase):
 
         self.assertEqual(self.run_review(invoke)['status'], 'complete')
 
-    def test_normal_request_keeps_existing_prompt_format_exactly(self):
-        self.pair('rules.md', 'unchanged\n' * 100 + 'old\n', 'unchanged\n' * 100 + 'new\n')
+    def test_small_request_keeps_existing_format_when_compaction_would_cost_more(self):
+        self.pair('rules.md', 'unchanged\n' * 3 + 'old\n', 'unchanged\n' * 3 + 'new\n')
         policy = 'operator policy'
         skill = 'review criteria'
         with patch.object(Path, 'read_text', side_effect=[policy, skill]):
@@ -102,16 +102,21 @@ class LargePromptTests(unittest.TestCase):
         expected = {**self.evidence.documents, key: extra}
         self.github.file = lambda *args, **options: extra
         prompts = []
+        seen = {}
 
         def model(prompt, *args, **options):
             prompts.append(prompt)
             self.assertLessEqual(len(prompt), review.MAX_PROMPT_CHARS)
+            data = self.data(prompt)
+            seen.update(expand(data))
             if len(prompts) == 1:
-                return {'status': 'needs_evidence', 'requests': [
-                    {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'dependency.py'}]}
+                return result(status='needs_evidence', progress='Changed sources checked; inspect the dependency.',
+                    reviewed_documents=list(self.evidence.documents), requests=[
+                    {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'dependency.py'}])
             self.assertGreater(len(json.dumps(self.evidence.for_prompt())), 1_200_000)
-            self.assertEqual(expand(self.data(prompt)), expected)
-            return result()
+            self.assertEqual(seen, expected)
+            self.assertEqual(set(data['documents']), {key})
+            return result(progress='', reviewed_documents=list(data['documents']), finding_decisions=[])
 
         with patch.object(self.reviewer, '_invoke', side_effect=model):
             self.assertEqual(self.reviewer.review(self.github, self.evidence)['status'], 'complete')
@@ -129,8 +134,8 @@ class LargePromptTests(unittest.TestCase):
     def test_irreducible_followup_stops_before_another_model_call(self):
         extra = 'x' * review.MAX_PROMPT_CHARS
         self.github.file = lambda *args, **options: extra
-        response = {'status': 'needs_evidence', 'requests': [
-            {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'dependency.py'}]}
+        response = result(status='needs_evidence', progress='Inspect the dependency.', requests=[
+            {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'dependency.py'}])
         with patch.object(self.reviewer, '_invoke', return_value=response) as model:
             with self.assertRaisesRegex(review.Incomplete, 'no model call started'):
                 self.reviewer.review(self.github, self.evidence)

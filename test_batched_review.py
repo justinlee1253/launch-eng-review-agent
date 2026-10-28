@@ -38,7 +38,7 @@ class BatchedReviewTests(unittest.TestCase):
     def response(self, data, **changes):
         value = result()
         if 'evidence_batch' in data:
-            value['reviewed_documents'] = list(data['documents'])
+            value['reviewed_documents'] = list(data['documents']) + list(data.get('document_aliases', {}))
             value['finding_decisions'] = []
         value.update(changes)
         return value
@@ -110,11 +110,12 @@ class BatchedReviewTests(unittest.TestCase):
     def test_call_budget_holds_instead_of_skipping_remaining_source(self):
         self.evidence.documents[self.prefix + 'huge.py'] = 'more source\n' * 30000
         calls = []
+        self.github.file = lambda *args, **kwargs: 'new supporting source\n'
 
         def model(prompt, **options):
             calls.append(options['review_round'])
             return self.response(self.data(prompt), status='needs_evidence', requests=[
-                {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'handler.py'}])
+                {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': f'additional{len(calls)}.py'}])
 
         with self.assertRaises(review.Incomplete):
             self.run_review(model)
