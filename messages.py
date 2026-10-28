@@ -143,7 +143,12 @@ def warning(job, status, text, *, diagnostic=None):
     elif 'no changed files' in lower:
         title, detail = 'Skipped', 'There are no changed files.'
         action, operator = 'No action needed until the PR contains changes.', False
-    elif 'manual' in lower or 'intervening justin' in lower or 'missing or dismissed' in lower:
+    elif 'context budget' in lower or ('review input has' in lower and 'cli limit' in lower):
+        detail = 'The review input exceeds the supported text-review limits.'
+        action = 'reduce the review input or arrange a manual review before retrying the agent.'
+    elif any(value in lower for value in (
+            'justin has a manual blocking review', 'justin has an unfinished manual review',
+            'intervening justin review/comment', 'effective review is missing or dismissed')):
         detail = 'An existing manual review or changed review decision needs attention.'
         action = 'resolve the manual review decision before retrying the agent.'
     elif 'account' in lower or 'github cli' in lower:
