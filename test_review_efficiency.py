@@ -147,6 +147,12 @@ class ReviewEfficiencyTests(unittest.TestCase):
 
         self.assertEqual(self.run_review(model)['status'], 'complete')
 
+    def test_duplicate_document_acknowledgments_are_rejected_by_the_host(self):
+        key = self.prefix + 'handler.py'
+        with self.assertRaisesRegex(review.Incomplete, 'coverage acknowledgement'):
+            self.run_review(lambda prompt, **kwargs: self.output(prompt, status='needs_evidence',
+                            reviewed_documents=[key, key], requests=[self.request()]))
+
     def test_partial_lens_coverage_does_not_remove_source_from_the_next_pass(self):
         self.github.file = lambda *args, **kwargs: 'caller source\n'
         calls = []

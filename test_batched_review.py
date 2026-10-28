@@ -76,6 +76,17 @@ class BatchedReviewTests(unittest.TestCase):
             self.run_review(model)
         self.assertEqual(self.github.submitted, [])
 
+    def test_duplicate_batch_acknowledgments_are_rejected_by_the_host(self):
+        def model(prompt, **options):
+            data = self.data(prompt)
+            value = self.response(data)
+            value['reviewed_documents'].append(value['reviewed_documents'][0])
+            return value
+
+        with self.assertRaisesRegex(review.Incomplete, 'coverage'):
+            self.run_review(model)
+        self.assertEqual(self.github.submitted, [])
+
     def test_requested_source_is_reviewed_and_prior_findings_reach_integration(self):
         requested = self.prefix + 'caller.py'
         self.github.file = lambda *args, **kwargs: 'call_changed_function()\n'

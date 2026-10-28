@@ -43,7 +43,7 @@ def schema(original):
     value['required'] += [key for key in ('reviewed_documents', 'finding_decisions') if key not in value['required']]
     value['properties']['summary']['maxLength'] = 2500
     value['properties']['reviewed_documents'] = {
-        'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True}
+        'type': 'array', 'items': {'type': 'string'}}
     value['properties']['finding_decisions'] = {
         'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
             'required': ['candidate', 'finding_index', 'reason'], 'properties': {
