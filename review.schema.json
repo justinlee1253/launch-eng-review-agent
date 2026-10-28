@@ -62,17 +62,17 @@
           },
           "ref": {
             "type": "string",
-            "enum": [
-              "head",
-              "base",
-              "main"
+            "anyOf": [
+              {"type": "string", "enum": ["head", "base", "main"]},
+              {"type": "string", "pattern": "^pr/[1-9][0-9]*$"}
             ]
           },
           "kind": {
             "type": "string",
             "enum": [
               "file",
-              "tree"
+              "tree",
+              "context"
             ]
           },
           "path": {

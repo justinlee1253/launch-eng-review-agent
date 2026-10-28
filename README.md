@@ -2,7 +2,7 @@
 
 Automated pull request reviews requested through a dedicated Google Chat space. The agent acknowledges a request, reviews a captured commit using Falcon criteria, submits an approval or request for changes on GitHub, and reports the outcome in the original Chat thread.
 
-The service runs locally on macOS. A lightweight Python listener handles intake independently of one sequential review worker, so incoming requests can be acknowledged while another review is running. Model inference runs remotely through the authenticated Codex CLI; idle polling does not invoke a model.
+The service runs locally on macOS. A lightweight Python listener handles intake independently of one or two isolated review workers, so incoming requests can be acknowledged while another review is running. Model inference runs remotely through the authenticated Codex CLI; idle polling does not invoke a model.
 
 ## Using the agent
 
@@ -19,9 +19,9 @@ https://github.com/ROKT/launch-engineering/pull/1234
 | 💬 | Changes requested | Explanation, GitHub review link, and commit SHA. |
 | ⚠️ | Review held or skipped | Reason and, where applicable, the next action. |
 
-Reactions are additive: 👀 remains as the receipt. The latest thread response explains the current state. Reposting the same reviewed commit reuses the existing result without another model review. A new commit can receive a fresh review.
+Every PR request message, including thread replies, has one current agent status. Status updates remove the agent's previous status before adding the new one; other people's reactions are preserved. Google exposes separate delete/create calls, so a transition can briefly show no status. Reposting the same reviewed commit reuses the existing result without another model review. A new commit can receive a fresh review.
 
-Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Requests from the operator's own Chat identity, bot messages, and PRs authored by either configured operator GitHub identity are excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
+Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Everyone in the designated space, including the operator, can request a review. The agent ignores its own outgoing replies and bot messages; PRs authored by either configured operator GitHub identity remain excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
 
 ### STAMP exception
 
@@ -58,7 +58,7 @@ flowchart LR
     subgraph mac["Local macOS runtime"]
         listener["Python listener<br/>Polling and thread delivery"]
         queue[("SQLite<br/>Queue, outbox, review ledger")]
-        worker["Python review worker<br/>One PR at a time"]
+        worker["Python review worker<br/>1–2 workers, one PR each"]
         keychain["macOS Keychain<br/>Google OAuth grant"]
         policy["Falcon skill<br/>Review policy and repository guidance"]
     end
@@ -80,13 +80,17 @@ The interactive diagram is a standalone HTML file; download it and open it in a 
 ### Request lifecycle
 
 1. **Receive.** The listener polls only the configured space every two seconds on a healthy connection. It persists eligible requests and queues the acknowledgment and 👀 reaction before advancing the scan checkpoint.
-2. **Schedule.** A SQLite queue selects requests in original posting order. One worker processes a PR at a time; the listener continues receiving requests. Reposts attach to active work instead of creating another review.
+2. **Schedule.** A SQLite queue selects requests in original posting order. Each worker processes one PR at a time; the listener continues receiving requests. Reposts attach to active work instead of creating another review.
 3. **Check eligibility.** The worker verifies the GitHub account, PR state, existing reviews, and CI status before spending model tokens. Pending CI waits; failed CI, drafts, merged/closed PRs, and conflicts produce a held result.
 4. **Collect evidence.** GitHub REST reads retrieve complete text changes and relevant files at captured commit SHAs. The worker includes repository instructions, local architecture context, Falcon criteria, and the review policy. Additional evidence requests are restricted to approved files and directories.
-5. **Review.** The Codex subprocess returns structured findings or requests for more evidence. The host validates completeness and file/line references. Missing required context cannot produce an approval.
+5. **Review.** The Codex subprocess returns structured findings or requests for more evidence. Absent supplemental files/directories are reported back to the reviewer so it can continue or explain a material evidence gap. The host saves the original draft and captured evidence before validating completeness and file/line references. A unique exact quotation can correct its own line number; other citation mismatches get at most one citation-only model pass, bounded to two minutes. Corrections cannot remove findings or change their meaning, blocking labels, or severity. Remaining mismatches hold the review with the exact finding, path, side, and line. Missing changed-file source or genuinely required context cannot produce an approval.
 6. **Publish.** The host rechecks account, head, PR state, CI, and intervening manual decisions, then reserves and submits one commit-anchored GitHub review. It queues the verdict and reaction for delivery to the original Chat thread.
 
 The model cannot publish directly. Shell, browser, plugins, MCP connections, hooks, and agent tools are disabled in the review subprocess. Python owns all validated evidence reads and external writes. Google Chat uses the REST API directly; GitHub REST requests use `gh api`. Neither Chat MCP nor GitHub MCP is required by this runtime.
+
+Each review attempt has one **20-minute overall budget**, starting when the worker begins the PR. Preflight, evidence capture, every model round, citation correction, and checks before publication share the same deadline. A model call can use all remaining time; it has no separate ten-minute cutoff. Citation correction still has its own two-minute maximum within that remaining time. Queue waiting and deferred CI waiting do not consume an attempt's budget.
+
+After expiry, the request is held and no new review write starts. Any completed draft remains available. A GitHub write already attempted is still reconciled and recorded, even after the deadline, so an uncertain result cannot cause a duplicate write. Chat delivery remains in the durable outbox. Shutdown reports `Worker stopped`; model timeouts have separate diagnostics and a `timed_out` usage status.
 
 ## Review policy
 
@@ -101,6 +105,26 @@ The review inputs are:
 - Repository guidance and source evidence at captured SHAs, plus required local architecture references.
 
 The configured model is GPT-6.1 Sol with Fast service and `xhigh` reasoning. Settings and reference credit rates live in [usage.py](usage.py). All review lenses run sequentially.
+
+Orbit guidance is selected only for changes under `Orbit/` (including previous paths on
+renames and removed files), or changed configuration/command lines in shared infrastructure
+that explicitly reference `Orbit/`. Unrelated services receive no Orbit vault context.
+The host embeds the existing Falcon Orbit reference as text; it does not fork or modify
+the skill. Repository rules remain anchored to the PR's captured commits.
+
+Orbit reviews receive the vault entry points, status/open questions, and relevant sections
+of the architecture page. Source changes may also load the connector README; UI changes
+load available product/design guidance. The model can request specific additional repository
+files or a page from the fixed local topic allowlist. Missing required context holds the
+review. Local summaries record their compiled SHA against pinned main and remain discovery
+context, not proof that a proposal is merged or deployed.
+
+A necessary companion PR can be read with `ref=pr/NUMBER`; its head is pinned and its
+merged/proposed/closed state is explicit. A changed dependency prevents publishing a verdict
+based on obsolete evidence. The repository allowlist and publishing permissions stay the same.
+`.runtime/context/` retains an atomic audit per job/head with inspected document paths,
+SHAs, local content hashes and selected guidance. It contains no source-document bodies or
+incoming Chat messages.
 
 ## Setup
 
@@ -131,6 +155,20 @@ https://www.googleapis.com/auth/chat.messages.reactions.create
 ```
 
 An existing grant should be checked rather than authorized again. Revocation or policy changes can still invalidate authorization; the runtime pauses and records the failure rather than repeatedly prompting. Keep OAuth client files and grants out of Git, Chat messages, and logs.
+
+Replacing a status also requires `https://www.googleapis.com/auth/chat.messages.reactions`.
+The older create-only grant remains valid for reads and messages. After explicitly approving
+this new capability, upgrade once using the client already in Keychain:
+
+```bash
+.venv/bin/python auth.py authorize --reaction-updates
+```
+
+This command requests read/create-message access plus full reaction access, opens one Google
+consent window, verifies offline refresh, and only then replaces the saved grant. It does not
+need another client JSON download. A declined or failed upgrade retains the local prior grant.
+The listener never starts this command or opens a permission window on its own. Without delete
+permission, it records one delivery failure rather than adding a conflicting second status.
 
 ### Configure and start
 
@@ -201,9 +239,13 @@ After repairing a Chat connection, verify and explicitly resume:
 
 Only a genuinely invalid Google grant requires explicit repair with `auth.py authorize --client-file ... --reauthorize`, followed by renewal verification. After investigating a held review, an operator can use `agent.py retry JOB_ID`. Reserved writes receive reconciliation only. STAMP requests without a reserved write require a fresh request from an authorized sender.
 
+Retries and reposts at the same head/base reuse a retained completed draft, including its consumed correction budget, across restarts. A new head/base requires fresh evidence and analysis. Account, CI, dependency, manual-review, and duplicate checks still apply. Resuming a review restores 👀 on all tracked messages for that PR; the final status replaces it.
+
 ### Local data
 
 `.runtime/state.sqlite3` stores queue state, message resource IDs/timestamps/threads, outgoing replies, review intents, usage, and the review ledger. Incoming message bodies are not retained. `.runtime/payloads/` contains outgoing GitHub review payloads. `.runtime/activity.log` rotates at 1 MB with three backups. The runtime directory is owner-only; credentials remain in Keychain or the respective CLI's authentication storage.
+
+`.runtime/drafts/` stores private JSON snapshots with the original draft, current corrected draft, captured source, exact citation errors, and correction history. Files are written atomically with owner-only permissions and excluded from Git. These snapshots can contain private repository code; retain them with the same care as the source checkout. A corrupt snapshot holds the request instead of silently spending tokens on another full review.
 
 Preserve the SQLite database and its WAL files together when backing up. Deleting state can lose pending work and deduplication history. A failed Chat delivery does not repeat a successful GitHub review.
 
@@ -232,6 +274,19 @@ Run the focused local checks:
 
 The suite uses fixtures for authorization, queue recovery, deduplication, evidence validation, changed heads, ambiguous writes, and listener responsiveness. It does not execute code from reviewed PRs. Reviews also do not run repository builds or test suites; GitHub review text states this limitation.
 
-The text-review limits are 150 changed files, 250 KB per file, 1.2 million serialized context characters, up to eight evidence rounds, and ten minutes per model invocation. Binary files, symlinks, submodules, inaccessible required context, and exceeded limits hold for manual attention. A GitHub review is anchored to a commit; the API does not provide an atomic guarantee that it remains the latest head.
+The text-review limits are 150 changed files, 250 KB per file, 1.2 million serialized context characters, up to eight evidence rounds, and one shared twenty-minute processing budget. Citation correction may use at most two minutes of the remaining budget. Binary files, symlinks, submodules, inaccessible required context, and exceeded limits hold for manual attention. A GitHub review is anchored to a commit; the API does not provide an atomic guarantee that it remains the latest head.
 
 Deployment acceptance must include a real threaded acknowledgment, the correct GitHub review identity, same-head deduplication, restart recovery, and silent token renewal. Unit tests and initial login alone do not establish live readiness.
+
+
+## Review worker capacity and safe rollout
+
+`worker_count` in `.runtime/config.json` accepts only the integers `1` and `2`; omitted means `1`. Restart to apply it. One process retains the existing lock, one Chat listener and one sender. Each worker creates its own SQLite connection, GitHub evidence cache and reviewer. Each attempt gets its own **twenty-minute total processing budget**, excluding queue and deferred CI waiting. Evidence collection, every model round, citation correction (at most two minutes within the remaining budget), and final publication checks share that deadline. Increasing capacity does not change model settings or per-PR criteria.
+
+SQLite claims use `BEGIN IMMEDIATE` and a unique owned-PR index. Ownership lasts through submission and reconciliation. A timeout or dashboard Stop affects only that request. Reserved writes remain reconciliation-only even if their response is lost or the process restarts; a repost attaches instead of starting another write. Interrupted model runs are held for explicit attention, with any unknown usage retained. Queue estimates use the next available worker and stay provisional; CI and unresolved writes have no invented completion time. Operational status and the dashboard show configured capacity and active workers (`Reviewing: 2/2`).
+
+Messages containing several PRs keep one status: 👀 while any is queued, reviewing, submitting or reconciling; then ⚠️ if any is unresolved; then 💬 if any requested changes; otherwise ✅ for approved outcomes, including reused approvals. History and other people's reactions are preserved.
+
+For deployment, finish active reviews before stopping the old process. Keep the same private runtime directory (database, drafts, outbox and saved authentication), acquire the existing process lock, and run startup recovery once before starting workers. First start with `worker_count: 1`, verify heartbeat, queue/history preservation and one listener, then drain active work again and restart with `worker_count: 2`. Observe genuine eligible requests when available; do not create requests or model spending just to test capacity. Measure process/model-child CPU and RSS and inspect per-PR records with `agent.py costs`. Roll back capacity by draining and restarting with `worker_count: 1`; never delete the queue or ledger. Graceful shutdown retains the process lock until all workers exit.
+
+The existing loopback dashboard is available with `.venv/bin/python dashboard.py`; it reuses the same runtime and exposes explicit remove/stop controls. No new services, dependencies or credentials are required.

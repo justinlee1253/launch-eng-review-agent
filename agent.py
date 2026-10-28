@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from auth import AuthRequired, ConfigError, CredentialManager, TemporaryAuthError
+from auth import AuthRequired, ConfigError, CredentialManager, TemporaryAuthError, can_update_reactions
 import usage
 import queue_eta
 import messages as chat_messages
@@ -54,12 +54,15 @@ class Config:
     poll_seconds: int = 2
     actor: str = 'justinlee1253'
     context_repositories: tuple = REPOS
+    worker_count: int = 1
     reactions: dict = field(default_factory=lambda: dict(REACTIONS))
 
     def __post_init__(self):
         if not re.fullmatch(r'spaces/[A-Za-z0-9_-]+', self.space):
             raise ConfigError('An exact Google Chat space resource is required.')
         timestamp(self.activated_at)
+        if type(self.worker_count) is not int or self.worker_count not in (1, 2):
+            raise ConfigError('worker_count must be the integer 1 or 2.')
         if self.poll_seconds != 2 or self.actor != 'justinlee1253' or self.self_user != SELF_USER:
             raise ConfigError('This pilot uses the agreed two-second interval and Justin identities.')
         if (not isinstance(self.reactions, dict) or set(self.reactions) != set(REACTIONS)
@@ -109,6 +112,7 @@ def pr_links(text):
 class Store:
     def __init__(self, path=RUNTIME / 'state.sqlite3', reactions=None):
         self.reactions = dict(reactions or REACTIONS)
+        self.worker_id = str(uuid.uuid4())
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path.parent.chmod(0o700)
@@ -139,6 +143,7 @@ class Store:
             create table if not exists events(
                 id integer primary key, at text not null, job text,
                 code text not null, unique_key text unique);
+            create table if not exists cancellations(job text primary key, requested_at text not null);
             create table if not exists model_runs(
                 id text primary key, job text, started_at text, finished_at text,
                 model text, effort text, service_tier text, status text,
@@ -149,12 +154,13 @@ class Store:
         columns = {row['name'] for row in self.db.execute('pragma table_info(jobs)')}
         for name, definition in {'requested_at': 'text', 'ready_after': 'real not null default 0',
                                  'mode': "text not null default 'review'", 'requester': 'text',
-                                 'head_moves': 'integer not null default 0'}.items():
+                                 'head_moves': 'integer not null default 0', 'owner': 'text', 'outcome': 'text'}.items():
             if name not in columns:
                 self.db.execute('alter table jobs add column ' + name + ' ' + definition)
         self.db.execute('update jobs set requested_at=coalesce((select min(created_at) from sources where sources.job=jobs.id), updated_at) where requested_at is null')
         self.db.execute('create index if not exists jobs_ready on jobs(status,ready_after,requested_at)')
         self.db.execute('create index if not exists source_pr on sources(repo,number,created_at)')
+        self.db.execute('create unique index if not exists jobs_owned_pr on jobs(repo,number) where owner is not null')
         legacy = self.meta('stamp_identity')
         if legacy:
             identities = self.meta('stamp_identities') or {}
@@ -187,7 +193,75 @@ class Store:
                         (id, kind, target, json.dumps(payload)))
 
     def _reaction(self, message, emoji):
-        self._outbox('reaction:' + message + ':' + emoji, 'reaction', message, {'emoji': {'unicode': emoji}})
+        id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'reaction:' + message))
+        managed = set(self.reactions.values()) | {emoji}
+        for row in self.db.execute("select payload from outbox where kind='reaction' and target=?", (message,)):
+            old = json.loads(row['payload'])
+            managed.update(old.get('managed_emojis', []))
+            managed.add(old['emoji']['unicode'])
+        payload = json.dumps({'emoji': {'unicode': emoji}, 'managed_emojis': sorted(managed)})
+        self.db.execute("update outbox set status='superseded' where kind='reaction' and target=? and id<>?", (message, id))
+        self.db.execute("""insert into outbox(id,kind,target,payload) values(?,'reaction',?,?)
+            on conflict(id) do update set payload=excluded.payload,status='pending',attempts=0,next_at=0,sent_at=null
+            where outbox.payload<>excluded.payload""", (id, message, payload))
+
+    def _message_reaction(self, message):
+        rows = self.db.execute("""select j.* from jobs j join
+            (select distinct repo,number from sources where message=?) s using(repo,number)
+            where j.id=(select newest.id from jobs newest where newest.repo=j.repo and newest.number=j.number
+                        order by newest.requested_at desc,newest.rowid desc limit 1)""", (message,)).fetchall()
+        if not rows:
+            return
+        if any(r['status'] in {'queued', 'reviewing', 'submitting', 'ambiguous'} for r in rows):
+            outcome = 'picked_up'
+        elif any(r['outcome'] not in {'approved', 'changes_requested'} for r in rows):
+            outcome = 'warning'
+        elif any(r['outcome'] == 'changes_requested' for r in rows):
+            outcome = 'changes_requested'
+        else:
+            outcome = 'approved'
+        self._reaction(message, self.reactions[outcome])
+
+    def _pr_reaction(self, job, emoji=None):
+        for source in self.db.execute('select distinct message from sources where repo=? and number=?',
+                                      (job['repo'], job['number'])).fetchall():
+            self._message_reaction(source['message'])
+
+    def _require_owner(self, job):
+        row = self.db.execute('select owner from jobs where id=?', (job['id'],)).fetchone()
+        if not row or row['owner'] != job.get('owner'):
+            raise ConfigError('Review ownership changed; request was preserved.')
+
+    def release(self, job):
+        with self.db:
+            row = self.db.execute('select owner from jobs where id=?', (job['id'],)).fetchone()
+            if row and row['owner'] is None:
+                return
+            self._require_owner(job)
+            self.db.execute('update jobs set owner=null where id=? and owner=?', (job['id'], job['owner']))
+
+    def processing(self, job):
+        with self.db:
+            self._pr_reaction(job, self.reactions['picked_up'])
+
+    def cancellation_requested(self, job):
+        return bool(self.db.execute('select 1 from cancellations where job=?', (job['id'],)).fetchone())
+
+    def reserve_submission(self, job, payload, marker):
+        # Serialize cancellation with the last local step before an external write.
+        with self.db:
+            self.db.execute('begin immediate')
+            self._require_owner(job)
+            if self.cancellation_requested(job):
+                return False
+            row = self.db.execute('select status from jobs where id=?', (job['id'],)).fetchone()
+            if not row or row['status'] != 'reviewing':
+                raise ConfigError('Request state changed before submission; no review was reserved.')
+            values = {'status': 'submitting', 'payload': json.dumps(payload), 'marker': marker, 'updated_at': utc()}
+            self.db.execute('update jobs set status=?,payload=?,marker=?,updated_at=? where id=?',
+                            (*values.values(), job['id']))
+        job.update(values)
+        return True
 
     def start_model_run(self, job):
         id = str(uuid.uuid4())
@@ -270,6 +344,7 @@ class Store:
 
     def ingest(self, config, messages, start, end, token):
         with self.db:
+            self.db.execute('begin immediate')
             for msg in sorted((m for m in messages if isinstance(m, dict)), key=lambda m: str(m.get('createTime', ''))):
                 name = msg.get('name', '')
                 thread = msg.get('thread', {}).get('name', '')
@@ -282,11 +357,18 @@ class Store:
                 if (msg.get('space', {}).get('name', config.space) != config.space
                         or not re.fullmatch(re.escape(config.space) + r'/messages/[A-Za-z0-9_.-]+', name)
                         or not re.fullmatch(re.escape(config.space) + r'/threads/[A-Za-z0-9_.-]+', thread)
-                        or sender.get('type') != 'HUMAN' or sender.get('name') == config.self_user
+                        or sender.get('type') != 'HUMAN'
                         or not re.fullmatch(r'users/[A-Za-z0-9_-]+', sender.get('name', ''))
                         or msg.get('deleteTime') or not in_window):
                     continue
                 text = msg.get('text', '')
+                if sender.get('name') == config.self_user:
+                    replies = self.db.execute("select response_name,payload from outbox where kind='message' and target=?",
+                                              (thread,))
+                    # Match the saved payload too when Chat accepted a send but its response was lost.
+                    if any(row['response_name'] == name or json.loads(row['payload']).get('text') == text
+                           for row in replies):
+                        continue
                 links = pr_links(text)
                 unsupported = [repo for repo, _ in pr_candidates(text) if repo.casefold() not in {r.casefold() for r in REPOS}]
                 if unsupported:
@@ -343,12 +425,23 @@ class Store:
     def history(self):
         return [dict(row) for row in self.db.execute('select * from jobs order by updated_at desc')]
 
-    def claim(self):
+    def claim(self, owner=None):
+        owner = owner or self.worker_id
         with self.db:
-            row = self.db.execute("select * from jobs where status in ('submitting','ambiguous','queued','waiting_ci') and ready_after<=? order by case when status in ('submitting','ambiguous') then 0 else 1 end,requested_at,rowid limit 1", (time.time(),)).fetchone()
-            if row and row['status'] in {'queued', 'waiting_ci'}:
-                self.db.execute("update jobs set status='reviewing',updated_at=? where id=?", (utc(), row['id']))
-            return dict(row) if row else None
+            self.db.execute('begin immediate')
+            row = self.db.execute("""select j.* from jobs j
+                where j.status in ('submitting','ambiguous','queued','waiting_ci') and j.ready_after<=?
+                and j.owner is null and not exists
+                    (select 1 from jobs busy where busy.repo=j.repo and busy.number=j.number and busy.id<>j.id
+                     and (busy.owner is not null or busy.status in ('submitting','ambiguous')))
+                order by case when j.status in ('submitting','ambiguous') then 0 else 1 end,j.requested_at,j.rowid limit 1""",
+                (time.time(),)).fetchone()
+            if not row:
+                return None
+            self.db.execute("""update jobs set owner=?,status=case when status in ('queued','waiting_ci')
+                then 'reviewing' else status end,updated_at=? where id=?""", (owner, utc(), row['id']))
+            # Keep the incoming status: review_one uses it to distinguish reconciliation.
+            return dict(row, owner=owner)
 
     def update(self, job, **values):
         allowed = {'status', 'head', 'base', 'payload', 'marker', 'review_id', 'review_url', 'result', 'ready_after', 'head_moves'}
@@ -356,6 +449,7 @@ class Store:
             raise ValueError('Invalid job update')
         values['updated_at'] = utc()
         with self.db:
+            self._require_owner(job)
             self.db.execute('update jobs set ' + ','.join(k + '=?' for k in values) + ' where id=?',
                             (*values.values(), job['id']))
         job.update(values)
@@ -365,14 +459,15 @@ class Store:
             text = chat_messages.warning(job, status, text, diagnostic=diagnostic)
         emoji = self.reactions[reaction]
         with self.db:
-            self.db.execute('update jobs set status=?,result=?,updated_at=? where id=?', (status, text, utc(), job['id']))
+            self._require_owner(job)
+            self.db.execute('update jobs set status=?,result=?,outcome=?,owner=null,updated_at=? where id=?', (status, text, reaction, utc(), job['id']))
             self.event(status, job['id'], unique=job['id'] + ':' + status + ':' + hashlib.sha256(text.encode()).hexdigest())
             for source in self.db.execute('select * from sources where job=?', (job['id'],)).fetchall():
                 key = job['id'] + ':' + hashlib.sha256(text.encode()).hexdigest() + ':' + source['thread']
                 self._outbox('result:' + key, 'message', source['thread'],
                              {'text': text, 'thread': {'name': source['thread']}})
-                self._reaction(source['message'], emoji)
-        job.update(status=status, result=text)
+            self._pr_reaction(job, emoji)
+        job.update(status=status, result=text, outcome=reaction, owner=None)
 
     def reviewed(self, repo, number, head, actor):
         row = self.db.execute('select * from ledger where repo=? and number=? and head=? and actor=?',
@@ -381,6 +476,7 @@ class Store:
 
     def record_review(self, job, actor, review):
         with self.db:
+            self._require_owner(job)
             self.db.execute('insert or replace into ledger values(?,?,?,?,?,?,?)',
                             (job['repo'], job['number'], job['head'], actor, review['id'], review['html_url'], review['state']))
             self.db.execute('update jobs set review_id=?,review_url=?,updated_at=? where id=?',
@@ -389,13 +485,27 @@ class Store:
 
     def recover(self):
         with self.db:
-            interrupted = self.db.execute("select distinct jobs.* from jobs join model_runs on model_runs.job=jobs.id where jobs.status='reviewing' and model_runs.status='running'").fetchall()
+            self.db.execute('update jobs set owner=null')
+            interrupted = self.db.execute("select distinct jobs.* from jobs join model_runs on model_runs.job=jobs.id where jobs.status='reviewing'").fetchall()
             for row in interrupted:
-                self.finish(dict(row), 'needs-attention', f"{row['repo']}#{row['number']} — Review held: model run was interrupted; usage may be unreported. Inspect costs before explicitly retrying.")
+                if self.cancellation_requested(row):
+                    self.finish(dict(row), 'cancelled', f"{row['repo']}#{row['number']} — Cancelled from the dashboard. Interrupted model usage may be unreported; inspect costs before reposting.")
+                else:
+                    self.finish(dict(row), 'needs-attention', f"{row['repo']}#{row['number']} — Review held: processing stopped after model work began; usage may be unreported. Inspect costs before explicitly retrying.")
             self.db.execute("update model_runs set status='interrupted',finished_at=? where status='running'", (utc(),))
             self.db.execute("update jobs set status='queued' where status='reviewing'")
             # A reserved write is reconciled, never blindly repeated after a crash.
             self.db.execute("update jobs set status='ambiguous' where status='submitting'")
+            self.db.execute("""update jobs set outcome=case
+                when json_extract(payload,'$.event')='APPROVE' then 'approved'
+                when json_extract(payload,'$.event')='REQUEST_CHANGES' then 'changes_requested'
+                else coalesce((select case ledger.event when 'APPROVED' then 'approved'
+                         when 'CHANGES_REQUESTED' then 'changes_requested' end from ledger
+                         where ledger.repo=jobs.repo and ledger.number=jobs.number and ledger.head=jobs.head), 'warning') end
+                where outcome is null and status in ('submitted','skipped')""")
+            for row in self.db.execute('select distinct message from sources').fetchall():
+                self._message_reaction(row['message'])
+            self._meta('single_status_reactions', True)
 
     def import_previous(self):
         with self.db:
@@ -413,8 +523,10 @@ class Chat:
         self.session = requests.Session()
 
     def request(self, method, resource, **kwargs):
-        if not (resource == self.config.space + '/messages'
-                or re.fullmatch(re.escape(self.config.space) + r'/messages/[A-Za-z0-9_.-]+/reactions', resource)):
+        reaction = re.escape(self.config.space) + r'/messages/[A-Za-z0-9_.-]+/reactions'
+        if not ((resource == self.config.space + '/messages' and method in {'GET', 'POST'})
+                or (re.fullmatch(reaction, resource) and method in {'GET', 'POST'})
+                or (re.fullmatch(reaction + r'/[A-Za-z0-9_.-]+', resource) and method == 'DELETE')):
             raise ConfigError('Chat access is restricted to the configured space.')
         for attempt in range(2):
             if not self.credentials or not self.credentials.valid or attempt:
@@ -435,6 +547,8 @@ class Chat:
             if response.status_code in (401, 403):
                 raise ChatBlocked('chat_access_denied_' + str(response.status_code))
             if response.status_code == 409 and resource.endswith('/reactions'):
+                return {}
+            if method == 'DELETE' and response.status_code in (200, 204, 404):
                 return {}
             if response.status_code == 429 or response.status_code >= 500:
                 raise TemporaryFailure('chat_service_' + str(response.status_code))
@@ -461,7 +575,37 @@ class Chat:
             payload['markupSyntax'] = 'MARKUP_SYNTAX_CHAT'
             return self.request('POST', self.config.space + '/messages', json=payload,
                 params={'requestId': row['id'], 'messageReplyOption': 'REPLY_MESSAGE_OR_FAIL'})
-        return self.request('POST', row['target'] + '/reactions', json=payload)
+        return self.sync_reaction(row['target'], payload)
+
+    def sync_reaction(self, message, payload):
+        resource = message + '/reactions'
+        desired = payload['emoji']['unicode']
+        managed = set(payload.get('managed_emojis', self.config.reactions.values())) | {desired}
+        statuses, token = [], None
+        for _ in range(3):
+            params = {'pageSize': 200, 'filter': 'user.name = "' + self.config.self_user + '"'}
+            if token:
+                params['pageToken'] = token
+            page = self.request('GET', resource, params=params)
+            for reaction in page.get('reactions', []):
+                if reaction.get('user', {}).get('name') != self.config.self_user or reaction.get('emoji', {}).get('unicode') not in managed:
+                    continue
+                if not re.fullmatch(re.escape(resource) + r'/[A-Za-z0-9_.-]+', reaction.get('name', '')):
+                    raise ConfigError('Reaction resource does not belong to the requested message.')
+                statuses.append(reaction)
+            token = page.get('nextPageToken')
+            if not token:
+                break
+        if token:
+            raise TemporaryFailure('reaction_list_incomplete')
+        obsolete = [r for r in statuses if r['emoji']['unicode'] != desired]
+        if obsolete and not can_update_reactions(self.credentials):
+            raise ConfigError('Replacing status requires the explicit reaction-permission upgrade; no browser was opened.')
+        # Delete first so a transition never deliberately displays two agent statuses.
+        for reaction in obsolete:
+            self.request('DELETE', reaction['name'])
+        current = next((r for r in statuses if r['emoji']['unicode'] == desired), None)
+        return current or self.request('POST', resource, json={'emoji': {'unicode': desired}})
 
 
 def scan_once(config, store, chat, cutoff=None):
@@ -496,18 +640,18 @@ def flush_outbox(store, chat, now=None):
         try:
             result = chat.send(row)
             with store.db:
-                store.db.execute("update outbox set status='sent',sent_at=?,response_name=? where id=?",
-                                 (utc(), result.get('name'), row['id']))
+                store.db.execute("update outbox set status='sent',sent_at=?,response_name=? where id=? and payload=?",
+                                 (utc(), result.get('name'), row['id'], row['payload']))
         except ChatBlocked as error:
             store.block_chat(str(error))
             return
         except TemporaryFailure:
             with store.db:
-                store.db.execute('update outbox set attempts=attempts+1,next_at=? where id=?',
-                    (now + min(300, 5 * 2 ** min(row['attempts'], 6)), row['id']))
+                store.db.execute('update outbox set attempts=attempts+1,next_at=? where id=? and payload=?',
+                    (now + min(300, 5 * 2 ** min(row['attempts'], 6)), row['id'], row['payload']))
         except ConfigError:
             with store.db:
-                store.db.execute("update outbox set status='needs-attention' where id=?", (row['id'],))
+                store.db.execute("update outbox set status='needs-attention' where id=? and payload=?", (row['id'], row['payload']))
                 store.event('chat_delivery_needs_attention', unique='delivery:' + row['id'])
 
 
@@ -533,7 +677,6 @@ def run(config, directory=RUNTIME):
         store.import_previous()
         store.recover()
         stop = threading.Event()
-        github, reviewer = GitHub(config, directory, stop), Reviewer(directory, stop)
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
         handler = RotatingFileHandler(directory / 'activity.log', maxBytes=1_000_000, backupCount=3)
@@ -543,6 +686,13 @@ def run(config, directory=RUNTIME):
 
         def review_loop():
             work = Store(directory / 'state.sqlite3', config.reactions)
+            github, reviewer = GitHub(config, directory, stop), Reviewer(directory, stop)
+            try:
+                worker_jobs(work, github, reviewer)
+            finally:
+                work.db.close()
+
+        def worker_jobs(work, github, reviewer):
             while not stop.is_set():
                 job = work.claim()
                 if not job:
@@ -552,18 +702,29 @@ def run(config, directory=RUNTIME):
                     review_one(config, work, github, reviewer, job)
                 except Exception as error:
                     # Never log third-party exception text, Chat bodies, or model source context.
-                    work.finish(job, 'needs-attention', f"{job['repo']}#{job['number']} — review paused ({type(error).__name__}). No automatic retry; inspect local history.")
-            work.db.close()
+                    if job.get('payload') and job['status'] in {'submitting', 'ambiguous'}:
+                        work.update(job, status='ambiguous')
+                        stop.set()
+                    else:
+                        work.finish(job, 'needs-attention', f"{job['repo']}#{job['number']} — review paused ({type(error).__name__}). No automatic retry; inspect local history.")
+                finally:
+                    work.release(job)
 
-        worker = threading.Thread(target=review_loop, name='falcon-review', daemon=True)
-        worker.start()
+        workers = [threading.Thread(target=review_loop, name=f'falcon-review-{i+1}', daemon=True)
+                   for i in range(config.worker_count)]
         chat = Chat(config)
         next_scan, failures = 0, 0
         with store.db:
             store.event('worker_started')
+            store._meta('worker_count', config.worker_count)
+            store._meta('queue_eta_enabled', True)
+            started = store.db.execute("select max(id) from events where code='worker_started'").fetchone()[0]
+            store._meta('queue_controls', {'version': 1, 'started_event': started})
+        for worker in workers:
+            worker.start()
         try:
             while not stop.is_set():
-                if not worker.is_alive():
+                if any(not worker.is_alive() for worker in workers):
                     with store.db:
                         store.event('review_thread_failed', unique='review_thread_failed')
                     stop.set()
@@ -584,7 +745,9 @@ def run(config, directory=RUNTIME):
                 stop.wait(1)
         finally:
             stop.set()
-            worker.join(timeout=45)
+            # Keep the process lock until every owner has stopped touching state.
+            for worker in workers:
+                worker.join()
             with store.db:
                 store.event('worker_stopped')
             store.db.close()
@@ -644,7 +807,8 @@ def main():
             store.update(dict(row), status='ambiguous' if row['payload'] else 'queued', ready_after=0, head_moves=0)
             print('Queued for reconciliation only.' if row['payload'] else 'Queued for a fresh review.')
         elif args.command == 'status':
-            print(json.dumps({'space': config.space, 'poll_seconds': config.poll_seconds, 'worker_count': 1,
+            print(json.dumps({'space': config.space, 'poll_seconds': config.poll_seconds, 'worker_count': config.worker_count,
+                'active_workers': store.db.execute('select count(*) from jobs where owner is not null').fetchone()[0],
                 'reactions': config.reactions,
                 'model': {'name': usage.MODEL, 'reasoning_effort': usage.EFFORT, 'service_tier': usage.SERVICE_TIER},
                 'checkpoint': store.meta('checkpoint'),
