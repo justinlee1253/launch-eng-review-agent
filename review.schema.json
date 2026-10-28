@@ -4,13 +4,20 @@
   "required": [
     "status",
     "summary",
+    "progress",
     "reviewed_head",
     "reviewed_files",
+    "reviewed_documents",
     "lenses",
     "requests",
     "findings"
   ],
   "properties": {
+    "progress": {
+      "type": "string",
+      "maxLength": 12000,
+      "description": "Private checkpoint of concrete conclusions, contracts, unresolved questions and remaining checks. No hidden reasoning trace. Empty on a completed review."
+    },
     "status": {
       "type": "string",
       "enum": [
@@ -30,6 +37,12 @@
       "items": {
         "type": "string"
       }
+    },
+    "reviewed_documents": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true,
+      "description": "Exact document and document_aliases keys actually reviewed, including reconstructed sources. Do not acknowledge documents only received but not reviewed."
     },
     "lenses": {
       "type": "array",

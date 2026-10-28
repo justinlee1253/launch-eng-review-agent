@@ -109,7 +109,7 @@ class DiagnosticTests(unittest.TestCase):
             calls[0] += 1
             if calls[0] == 1:
                 Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps({
-                    'status': 'needs_evidence', 'requests': [{'repo': 'ROKT/launch-engineering',
+                    'status': 'needs_evidence', 'progress': 'Inspect the dependency.', 'requests': [{'repo': 'ROKT/launch-engineering',
                     'ref': 'head', 'path': 'dependency.py', 'kind': 'file'}]}))
                 return SimpleNamespace(returncode=0, poll=lambda: 0)
             kwargs['stderr'].write(b'HTTP 502 request_id=req_0123456789abcdef0123456789abcdef')
