@@ -34,21 +34,24 @@ The README diagram is an image, so this is the text map. Prefix paths with `ad-s
   6. Save to the database (`models/alert.save_to_db`), unless the alert is a trial.
   7. Hand off to `account_alert_service.process_alert_dd` for Jira tickets, tags, product type and auto-close.
 - Group monitor path: `group_monitors/datadog_webhook.py` saves the event, then posts one Chat message. It has its own template and space.
-- Detector path: `detector/detector_event_controller.py` runs three steps:
-  1. Save the event.
-  2. Pick the channels (`detector_event_checker.py`).
-  3. Dedupe by detector window (`detector_event_suppressor.py`).
-
-  It then sends through `channels/` (Jira and Chat clients, built by `channels/channel_factory.py`). Dev uses mocks.
+- Detector path, in order, in `detector/detector_event_controller.py`:
+  1. Parse the event and pick the channels (`detector/detector_event_checker.py`); return if no rules match.
+  2. Save the event (`detector/detector_event_repository.py`).
+  3. Dedupe by detector window (`detector/detector_event_suppressor.py`); return if suppressed.
+  4. Apply the muted-detector/subtype whitelist (`constants.py`).
+  5. NHM/attribute events call `AccountAlertService.process_alert_nhm` (`account_alert_service.py`) to create or update Jira tickets, then continue to channel delivery.
+  6. Holt-Winters events with account id/type apply the residual threshold. Partners require active page variants, call `AccountAlertService.process_alert_hw` for Jira ticket creation/update, and return before channel delivery. Advertisers require active campaigns and continue through channels.
+  7. Look up account data, send through `channels/` (Jira and Chat clients, built by `channels/channel_factory.py`), then save each notification for deduplication. Dev uses mocks.
 - Data ownership:
   - ad-sentinel owns the `sentinel` schema in Postgres (alert log, Jira ticket links, killswitch, detector events, recipients), through `controllers/db.py` and `sql/queries/pg_*.sql`.
   - It reads, but does not own, ClickHouse, StarRocks and Trino (`clickhouse.py`, `starrocks.py`, `trino_db.py`, `sql/queries/{ch,sr,trino}_dictionary.sql`).
 - Downstream writes:
   - Jira (`controllers/jira_operations.py`, `channels/jira_*`).
   - Google Chat (`controllers/gchat.py`, `channels/gchat_*`).
-  - Email through op3-notifications (`notification.py`).
+  - Email through OP3 Notifications `POST /api/v1/send/email`, delivered by SparkPost (`notification.py`). The platform token needs `SendNotifications` or `ManageOP3` in Polaris.
   - Datadog metrics (`controllers/dogstatsd.py`).
-  - Reads from the Rokt platform, transactions and supplementals APIs (`controllers/rokt_api.py`, `controllers/supplementals.py`).
+  - Supplementals task creation: `controllers/supplementals.py` posts Jira/account details to `POST /api/v1/tasks/anomaly-detection`, triggering downstream enrichment. Verify the receiving `ADTaskCreationRequest` contract in `Supplementals/packages/common/common/contracts/tasks.py` and `publish_ad_task` in `Supplementals/api/api/v1/tasks/handler.py`, which publishes to Kafka for the AD enricher.
+- Downstream reads: Rokt platform and transactions APIs (`controllers/rokt_api.py`).
 
 A change on one path is checked against the safety steps of that path. A new path is checked against all of them (items 5 to 12).
 
@@ -81,6 +84,6 @@ A change on one path is checked against the safety steps of that path. A new pat
 ## Deploy and CI
 
 15. The Service stays `ClusterIP` and the pod runs as non-root user 2000. Stage skips canary steps; prod does not. A change to either in prod: `should_fix`, blocking.
-16. The task role reads its secrets, decrypts with KMS, connects to RDS by IAM and sends SES email. A new action, or a new `Resource: "*"` on an action that accepts an ARN: section 6, item 4.
+16. The task role reads its secrets, decrypts with KMS and connects to RDS by IAM. Email uses OP3 Notifications/SparkPost with platform-token authorization (`notification.py`). A new IAM action, or a new `Resource: "*"` on an action that accepts an ARN: section 6, item 4.
 17. Every branch deploys to stage. A pipeline change that removes the manual block before prod, or lets a branch other than `main` or `hotfix/*` reach prod: `dangerous`.
 18. The pytest step pipes to `tee`, so it cannot fail the build; the junit annotate step is the real gate (`docs/testing.md`, "Reading CI test results"). Lint steps soft-fail. A green build is weak evidence. Describe CI exactly as reported and ask for a test only for a dangerous path.
