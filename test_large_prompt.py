@@ -92,6 +92,52 @@ class LargePromptTests(unittest.TestCase):
                 return result()
             self.run_review(invoke)
 
+    def test_followup_over_old_capture_limit_reaches_model_with_complete_source(self):
+        for index in range(4):
+            common = ''.join(f'line {index} {line}: unchanged source\n' for line in range(4400))
+            self.pair(f'large{index}.py', common + 'return old\n', common + 'return new\n')
+        self.evidence.check_budget()
+        extra = 'additional dependency source\n' * 6500
+        key = self.evidence.repo + '@' + HEAD + ':dependency.py'
+        expected = {**self.evidence.documents, key: extra}
+        self.github.file = lambda *args, **options: extra
+        prompts = []
+
+        def model(prompt, *args, **options):
+            prompts.append(prompt)
+            self.assertLessEqual(len(prompt), review.MAX_PROMPT_CHARS)
+            if len(prompts) == 1:
+                return {'status': 'needs_evidence', 'requests': [
+                    {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'dependency.py'}]}
+            self.assertGreater(len(json.dumps(self.evidence.for_prompt())), 1_200_000)
+            self.assertEqual(expand(self.data(prompt)), expected)
+            return result()
+
+        with patch.object(self.reviewer, '_invoke', side_effect=model):
+            self.assertEqual(self.reviewer.review(self.github, self.evidence)['status'], 'complete')
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(self.evidence.documents, expected)
+
+    def test_capture_storage_limit_applies_even_to_compressible_evidence(self):
+        self.pair('large.py', 'unchanged\n' * 300, 'unchanged\n' * 300)
+        original = copy.deepcopy(self.evidence.documents)
+        with patch.object(review, 'MAX_CAPTURE_BYTES', 2000, create=True):
+            with self.assertRaisesRegex(review.Incomplete, 'storage limit'):
+                self.evidence.check_budget()
+        self.assertEqual(self.evidence.documents, original)
+
+    def test_irreducible_followup_stops_before_another_model_call(self):
+        extra = 'x' * review.MAX_PROMPT_CHARS
+        self.github.file = lambda *args, **options: extra
+        response = {'status': 'needs_evidence', 'requests': [
+            {'repo': self.evidence.repo, 'ref': 'head', 'kind': 'file', 'path': 'dependency.py'}]}
+        with patch.object(self.reviewer, '_invoke', return_value=response) as model:
+            with self.assertRaisesRegex(review.Incomplete, 'no model call started'):
+                self.reviewer.review(self.github, self.evidence)
+            self.assertEqual(model.call_count, 1)
+        self.assertEqual(self.evidence.documents[self.evidence.repo + '@' + HEAD + ':dependency.py'], extra)
+        self.assertEqual(self.github.submitted, [])
+
     def test_packed_sources_round_trip_line_endings_unicode_and_edits(self):
         rng = random.Random(284)
         cases = [('', 'added\n'), ('removed\n', ''), ('same\n' * 300, 'same\n' * 300),

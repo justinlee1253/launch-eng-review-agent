@@ -28,7 +28,8 @@ from queue_controls import Cancelled
 
 SHA = re.compile(r'[0-9a-f]{40}')
 JUSTIN = {'justinlee1253', 'justin-lee_rokt'}
-MAX_CONTEXT = 1_200_000
+# Bound retained originals separately from the compressed model request.
+MAX_CAPTURE_BYTES = 10_000_000
 # Codex turn/start counts Unicode characters, independently of model tokens.
 MAX_PROMPT_CHARS = 1_048_576
 MAX_FILE = 250_000
@@ -454,8 +455,11 @@ class Evidence:
         self.provenance, self.scope = [], None
 
     def check_budget(self):
-        if len(json.dumps(self.for_prompt(), ensure_ascii=False, separators=(',', ':'))) + sum(len(text) for text in self.references.values()) > MAX_CONTEXT:
-            raise Incomplete('Evidence exceeds the pilot context budget; manual review is required.')
+        size = len(json.dumps(self.as_dict(), ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+        size += sum(len(text.encode('utf-8')) for text in self.references.values())
+        if size > MAX_CAPTURE_BYTES:
+            raise Incomplete(f'Captured evidence exceeds the {MAX_CAPTURE_BYTES:,}-byte storage limit; '
+                             'no review may be published.')
 
     def as_dict(self):
         return {'repository': self.repo, 'head': self.head, 'base': self.base, 'merge_base': self.ancestor,
