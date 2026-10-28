@@ -58,7 +58,7 @@ class EfficiencyTests(unittest.TestCase):
         self.store.ingest(self.config, [duplicate], START, END, None)
         self.assertEqual(len(self.store.history()), 1)
         replies = [json.loads(row[0])['text'] for row in self.store.db.execute("select payload from outbox where kind='message'")]
-        self.assertTrue(any('18:52:00' in text and 'Already requested' in text for text in replies))
+        self.assertTrue(any('2:52 PM ET' in text and 'Original request' in text for text in replies))
 
     def test_fifo_uses_original_request_time_even_after_job_is_updated(self):
         first = self.enqueue()
