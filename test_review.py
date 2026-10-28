@@ -140,7 +140,18 @@ class ReviewTests(unittest.TestCase):
     def test_manual_block_on_previous_head_is_not_overwritten(self):
         self.github.timeline = [{'id': 99, 'user': {'login': 'justinlee1253'}, 'state': 'CHANGES_REQUESTED',
                                  'commit_id': BASE, 'body': 'Manual review'}]
-        self.assertEqual(self.run_review()['status'], 'needs-attention')
+        job = self.run_review()
+        self.assertEqual(job['status'], 'needs-attention')
+        text = job['result']
+        self.assertIn('Review paused — an earlier review still requests changes', text)
+        self.assertIn('Blocking reviewer: @justinlee1253', text)
+        self.assertIn('<https://github.com/ROKT/launch-engineering/pull/6000#pullrequestreview-99|Read the blocking review>', text)
+        self.assertIn('PR author: Address the blockers in the linked review, then ask the reviewer to reassess.', text)
+        self.assertIn('Once satisfied, resolve or dismiss the blocking review, then retry the agent.', text)
+        self.assertIn('New commits and retries do not automatically clear this block.', text)
+        self.assertIn('The agent stopped before code analysis and posted no new review.', text)
+        self.assertIn('agent.py retry ' + job['id'], text)
+        self.assertNotIn('Manual review', text)
         self.assertEqual(self.github.submitted, [])
 
     def test_same_head_review_is_reused_after_repost(self):
@@ -155,7 +166,12 @@ class ReviewTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.github.timeline = [{'id': 99, 'user': {'login': 'justinlee1253'}, 'state': state,
                                         'commit_id': HEAD, 'body': 'Manual review in progress'}]
-                self.assertEqual(self.run_review()['status'], 'needs-attention')
+                job = self.run_review()
+                self.assertEqual(job['status'], 'needs-attention')
+                self.assertIn('Blocking reviewer: @justinlee1253', job['result'])
+                self.assertIn('Review state: ' + state, job['result'])
+                self.assertIn('#pullrequestreview-99', job['result'])
+                self.assertNotIn('Address the blockers', job['result'])
         self.assertEqual(self.github.submitted, [])
 
     def test_other_justin_accounts_active_manual_block_remains_effective(self):
@@ -163,7 +179,11 @@ class ReviewTests(unittest.TestCase):
             {'id': 98, 'user': {'login': 'justin-lee_rokt'}, 'state': 'CHANGES_REQUESTED', 'commit_id': BASE, 'body': 'Manual block'},
             {'id': 99, 'user': {'login': 'justinlee1253'}, 'state': 'APPROVED', 'commit_id': BASE, 'body': '<!-- justin-falcon-review:old -->'},
         ]
-        self.assertEqual(self.run_review()['status'], 'needs-attention')
+        job = self.run_review()
+        self.assertEqual(job['status'], 'needs-attention')
+        self.assertIn('Blocking reviewer: @justin-lee_rokt', job['result'])
+        self.assertIn('#pullrequestreview-98', job['result'])
+        self.assertNotIn('#pullrequestreview-99', job['result'])
         self.assertEqual(self.github.submitted, [])
 
     def test_head_moves_before_post_so_old_verdict_is_not_sent(self):

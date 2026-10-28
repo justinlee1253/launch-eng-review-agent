@@ -75,9 +75,10 @@ def duplicate(job, first):
     return text + (' ' + original_request(first) if first else '')
 
 
-def warning(job, status, text, *, diagnostic=None):
+def warning(job, status, text, *, diagnostic=None, blocking_review=None):
     """Known host errors get an action; unknown errors never expose arbitrary exception text."""
     title, detail, action, operator = 'Review paused', '', 'inspect this run and retry after resolving the failure.', True
+    manual_steps = None
     reason = re.split(r'Review held(?: —|:)\s*', text, maxsplit=1)[-1]
     lower = reason.lower()
     review_link = re.search(r'https://github\.com/' + re.escape(job['repo']) + r'/pull/' + str(job['number']) + r'#pullrequestreview-[0-9]+', text)
@@ -151,6 +152,26 @@ def warning(job, status, text, *, diagnostic=None):
             'intervening justin review/comment', 'effective review is missing or dismissed')):
         detail = 'An existing manual review or changed review decision needs attention.'
         action = 'resolve the manual review decision before retrying the agent.'
+        if blocking_review:
+            actor = blocking_review.get('user', {}).get('login', '')
+            state = blocking_review.get('state')
+            review_id = blocking_review.get('id')
+            if (isinstance(actor, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,100}', actor)
+                    and state in {'CHANGES_REQUESTED', 'COMMENTED', 'PENDING'}
+                    and type(review_id) is int and review_id > 0):
+                url = f"https://github.com/{job['repo']}/pull/{job['number']}#pullrequestreview-{review_id}"
+                detail = f'Blocking reviewer: @{actor}\nReview state: {state}\n<{url}|Read the blocking review>'
+                if state == 'CHANGES_REQUESTED':
+                    title = 'Review paused — an earlier review still requests changes'
+                    detail += '\n\nNew commits and retries do not automatically clear this block.'
+                    manual_steps = [
+                        'PR author: Address the blockers in the linked review, then ask the reviewer to reassess.',
+                        f'Justin: {MAINTAINER}\nOnce satisfied, resolve or dismiss the blocking review, then retry the agent.',
+                    ]
+                else:
+                    title = 'Review paused — an earlier manual review needs attention'
+                    manual_steps = [f'Justin: {MAINTAINER}, finish or resolve the linked manual review before retrying the agent.']
+                detail += '\nThe agent stopped before code analysis and posted no new review.'
     elif 'account' in lower or 'github cli' in lower:
         detail = 'The GitHub account or access needs attention.'
         action = 'verify the connected GitHub account and repository access, then retry.'
@@ -203,7 +224,14 @@ def warning(job, status, text, *, diagnostic=None):
         check = re.search(r'https://buildkite\.com/[^\s<>?#]+', reason) or re.search(r'https://github\.com/[^\s<>?#]+/(?:runs|actions/runs)/[0-9]+', reason)
         url = check[0] if check else f"https://github.com/{job['repo']}/pull/{job['number']}/checks"
         lines.append(f'<{url}|View CI checks>')
-    lines += ['', 'Next: ' + (MAINTAINER + ', ' if operator else '') + action]
+    if manual_steps and not diagnostic:
+        lines += ['', 'Next:', '\n\n'.join(manual_steps), '', 'Maintainer details:']
+        if job.get('mode') == 'stamp':
+            lines.append('After resolving the issue, an authorized sender must post a fresh STAMP request.')
+        else:
+            lines.append('After resolving the issue, run agent.py retry ' + job['id'] + '. Existing evidence and publishing checks still apply.')
+    else:
+        lines += ['', 'Next: ' + (MAINTAINER + ', ' if operator else '') + action]
     if operator:
         lines.append('Ref: ' + job['id'][:8])
     return '\n'.join(line for line in lines if line is not None)
