@@ -23,6 +23,7 @@ import usage
 import diagnostics
 import orbit_context
 import review_drafts
+import review_batches
 from queue_controls import Cancelled
 
 
@@ -611,7 +612,7 @@ class Reviewer:
             raise ConfigError('The existing authenticated Codex CLI is required.')
         self.cli_version = diagnostics.cli_version(self.executable)
 
-    def invoke(self, prompt, *, job=None, guard=None, schema=None, timeout=None, evidence=None, review_round=None):
+    def invoke(self, prompt, *, job=None, guard=None, schema=None, timeout=None, evidence=None, review_round=None, batch=False):
         if len(prompt) > MAX_PROMPT_CHARS:
             raise Incomplete(f'Review input has {len(prompt):,} characters; the Codex CLI limit is '
                              f'{MAX_PROMPT_CHARS:,}. Compact the evidence or review manually; no model call started.')
@@ -636,7 +637,7 @@ class Reviewer:
                          service_tier=usage.SERVICE_TIER, **self.model_diagnostics)
         status = 'failed'
         try:
-            result = self._invoke(prompt, guard, schema=schema, timeout=timeout)
+            result = self._invoke(prompt, guard, schema=schema, timeout=timeout, **({'batch': True} if batch else {}))
             status = 'completed'
             return result
         except (HeadMoved, WaitForCI, Cancelled, WorkerStopped) as error:
@@ -661,7 +662,7 @@ class Reviewer:
             store.end_model_run(run, status, tokens)
             store.db.close()
 
-    def _invoke(self, prompt, guard=None, *, schema=None, timeout=None):
+    def _invoke(self, prompt, guard=None, *, schema=None, timeout=None, batch=False):
         budget = getattr(self, 'budget', None) or ReviewBudget()
         deadline = min(budget.deadline, time.monotonic() + timeout) if timeout is not None else budget.deadline
         # No inherited MCP/plugin configuration, shell, browser, agents, or credential tools.
@@ -672,6 +673,10 @@ class Reviewer:
                     'tool_suggest', 'auth_elicitation', 'in_app_browser', 'in_app_chat', 'goals']
         with tempfile.TemporaryDirectory(prefix='model-', dir=self.directory) as scratch:
             output = Path(scratch) / 'result.json'
+            if batch:
+                batch_schema = Path(scratch) / 'batch.schema.json'
+                batch_schema.write_text(json.dumps(review_batches.schema(json.loads((ROOT / 'review.schema.json').read_text()))))
+                schema = batch_schema
             args = [self.executable, '-a', 'never', '--strict-config', 'exec', '--ignore-user-config', '--ignore-rules',
                     '--model', usage.MODEL, '-c', 'model_reasoning_effort="' + usage.EFFORT + '"',
                     '-c', 'service_tier="' + usage.SERVICE_TIER + '"', '-c', 'features.fast_mode=true',
@@ -801,6 +806,7 @@ class Reviewer:
                 {'path': path, 'kind': 'review_instructions', 'sha256': hashlib.sha256(text.encode()).hexdigest(),
                  'compiled_sha': None, 'freshness': 'unversioned'}]
         budget = getattr(self, 'budget', None) or ReviewBudget()
+        prior_outputs = []
         def guard():
             job = {'repo': evidence.repo, 'number': evidence.number, 'head': evidence.head}
             current = github.pr(evidence.repo, evidence.number)
@@ -820,11 +826,15 @@ class Reviewer:
             if len(prompt) > MAX_PROMPT_CHARS:
                 prompt = instructions + COMPACT_SOURCE_NOTE + evidence_header + json.dumps(
                     evidence.for_prompt(compact_base=True), ensure_ascii=False, separators=(',', ':'))
+            if len(prompt) > MAX_PROMPT_CHARS:
+                return review_batches.run(self, github, evidence, instructions, evidence_header,
+                                          guard, budget, review_round, prior_outputs)
             orbit_context.audit(self.directory, evidence)
             guard()
             output = self.invoke(prompt, job=evidence.job_id, guard=guard, evidence=evidence, review_round=review_round, timeout=budget.remaining())
             if output.get('status') != 'needs_evidence':
                 return output
+            prior_outputs.append(copy.deepcopy(output))
             evidence.fulfill(github, output.get('requests'))
             orbit_context.audit(self.directory, evidence)
         raise Incomplete('Review needs more evidence than the bounded pilot budget allows.')
