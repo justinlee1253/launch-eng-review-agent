@@ -9,11 +9,13 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
 from agent import ConfigError, REPOS, ROOT, Store
 import usage
+import diagnostics
 
 
 SHA = re.compile(r'[0-9a-f]{40}')
@@ -129,13 +131,23 @@ class GitHub:
         if payload:
             args += ['--method', 'POST', '--input', str(payload)]
         args += [endpoint]
+        started = time.monotonic()
+        def failed(category, **details):
+            diagnostics.emit('github_request_failed', warning=True,
+                method='POST' if payload else 'GET', endpoint=diagnostics.endpoint_name(endpoint),
+                elapsed_ms=diagnostics.elapsed(started), error_category=category, **details)
         try:
             response = subprocess.run(args, capture_output=True, timeout=40, env={**os.environ, 'GH_PROMPT_DISABLED': '1', 'GIT_TERMINAL_PROMPT': '0'})
-        except (subprocess.TimeoutExpired, OSError):
+        except (subprocess.TimeoutExpired, OSError) as error:
+            failed('timeout' if isinstance(error, subprocess.TimeoutExpired) else 'process_error')
             if payload:
                 raise AmbiguousWrite('GitHub write response unavailable.') from None
             raise GitHubError('GitHub read unavailable.') from None
         if response.returncode:
+            status = re.search(rb'\bHTTP ([1-5][0-9]{2})\b', response.stderr)
+            status = int(status[1]) if status else None
+            failed(diagnostics.error_category(response.stderr, status),
+                   http_status=status, exit_code=response.returncode)
             if payload:
                 raise AmbiguousWrite('GitHub write did not return a verified review.')
             if re.search(rb'\bHTTP 404\b', response.stderr):
@@ -144,6 +156,7 @@ class GitHub:
         try:
             return json.loads(response.stdout)
         except (ValueError, UnicodeError):
+            failed('invalid_json')
             if payload:
                 raise AmbiguousWrite('GitHub returned an unverified write result.') from None
             raise GitHubError('GitHub returned invalid JSON.') from None
@@ -411,6 +424,12 @@ class Reviewer:
         store = Store(self.directory / 'state.sqlite3')
         run = store.start_model_run(job)
         self.last_usage, self.model_started = None, False
+        self.model_diagnostics = {}
+        started = time.monotonic()
+        context = {**(diagnostics.CONTEXT.get() or {}), 'stage': 'model', 'run_id': run}
+        context.setdefault('job', {'id': job})
+        token = diagnostics.CONTEXT.set(context)
+        diagnostics.emit('model_run_started', model=usage.MODEL, effort=usage.EFFORT, service_tier=usage.SERVICE_TIER)
         status = 'failed'
         try:
             result = self._invoke(prompt, guard)
@@ -420,6 +439,11 @@ class Reviewer:
             status = 'cancelled'
             raise
         finally:
+            error = sys.exc_info()[0]
+            diagnostics.emit('model_run_finished', warning=status not in {'completed', 'cancelled'}, status=status,
+                elapsed_ms=diagnostics.elapsed(started), error_type=error.__name__ if error else None,
+                **self.model_diagnostics)
+            diagnostics.CONTEXT.reset(token)
             tokens = self.last_usage if self.model_started else {
                 'input_tokens': 0, 'cached_input_tokens': 0, 'output_tokens': 0, 'reasoning_output_tokens': 0}
             store.end_model_run(run, status, tokens)
@@ -484,7 +508,17 @@ class Reviewer:
                             except ValueError:
                                 continue  # A terminated process may leave a partial final event.
                         self.last_usage = usage.reported_usage(events)
+                        self.model_diagnostics = {'exit_code': child.returncode,
+                            'structured_output': 'present' if output.is_file() else 'missing'}
                     if child.returncode != 0 or not output.exists() or output.stat().st_size > 150_000:
+                        stderr.seek(0, os.SEEK_END)
+                        stderr.seek(max(0, stderr.tell() - 16_384))
+                        errors = [str(event.get('message', ''))[:4096] for event in events if event.get('type') == 'error']
+                        errors += [str(event.get('error', {}).get('message', ''))[:4096]
+                                   for event in events if event.get('type') == 'turn.failed' and isinstance(event.get('error'), dict)]
+                        self.model_diagnostics.update(failure_reason='process_exit' if child.returncode != 0 else
+                            'missing_structured_output' if not output.exists() else 'oversized_structured_output',
+                            error_category=diagnostics.error_category(stderr.read().decode('utf-8', errors='replace') + '\n'.join(errors)))
                         raise Incomplete('Codex did not return a complete structured review; check saved login and usage.')
                     for event in events:
                         if event.get('type') in {'item.started', 'item.updated', 'item.completed'} and event.get('item', {}).get('type') not in {'agent_message', 'reasoning'}:
@@ -500,8 +534,13 @@ class Reviewer:
                                 continue
                             kind = kind if re.fullmatch('[a-z_]{1,40}', kind) else 'unknown'
                             raise Incomplete('Unexpected reviewer item (' + kind + '); publishing is disabled for this request.')
-                    return json.loads(output.read_text())
-            except (OSError, ValueError):
+                    try:
+                        return json.loads(output.read_text())
+                    except (ValueError, UnicodeError):
+                        self.model_diagnostics.update(failure_reason='invalid_structured_output')
+                        raise
+            except (OSError, ValueError) as error:
+                self.model_diagnostics.setdefault('failure_reason', 'process_error' if isinstance(error, OSError) else 'invalid_structured_output')
                 raise Incomplete('Codex execution or structured output failed; no verdict will be posted.') from None
 
     def review(self, github, evidence):
@@ -610,6 +649,10 @@ def reconcile(github, job, actor):
 
 
 def review_one(config, store, github, reviewer, job):
+    context = {'job': job, 'stage': 'preflight'}
+    token = diagnostics.CONTEXT.set(context)
+    started = time.monotonic()
+    diagnostics.emit('review_started')
     def hold(reason):
         store.finish(job, 'needs-attention', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\nReview held — {reason}")
 
@@ -643,6 +686,7 @@ def review_one(config, store, github, reviewer, job):
         if github.actor() != config.actor:
             raise Incomplete('Authenticated GitHub account differs from justinlee1253; no account was switched.')
         if job['status'] in {'submitting', 'ambiguous'}:
+            context['stage'] = 'reconciliation'
             review = reconcile(github, job, config.actor)
             store.record_review(job, config.actor, review)
             current = github.pr(job['repo'], job['number'])
@@ -689,16 +733,20 @@ def review_one(config, store, github, reviewer, job):
                                + '\nPR head: ' + job['head'] + '\n\n' + marker(job['repo'], job['number'], job['head'], stamp=True)}
             output = {'summary': 'approved as requested without code review.'}
         else:
+            context['stage'] = 'evidence_capture'
             evidence = github.capture(job, pr)
             evidence.job_id, evidence.ci, evidence.number = job['id'], ci, job['number']
             evidence.description['existing_reviews_untrusted'] = reviews
             evidence.description['inline_comments_untrusted'] = comments
             evidence.check_budget()
+            context['stage'] = 'review'
             output = reviewer.review(github, evidence)
+            context['stage'] = 'validation'
             payload = review_payload(job, evidence, output)
         if getattr(reviewer, 'stop', None) and reviewer.stop.is_set():
             raise Incomplete('Worker stopped before submission.')
         # Recheck the actual actor and manual decisions immediately before reserving one write.
+        context['stage'] = 'pre_submit'
         if github.actor() != config.actor:
             raise Incomplete('GitHub account changed during review; posting paused.')
         latest_reviews = github.reviews(job['repo'], job['number'])
@@ -716,11 +764,13 @@ def review_one(config, store, github, reviewer, job):
         if getattr(reviewer, 'stop', None) and reviewer.stop.is_set():
             raise Incomplete('Worker stopped; no review was submitted.')
         store.update(job, status='submitting', payload=json.dumps(payload), marker=marker(job['repo'], job['number'], job['head'], stamp=stamp))
+        context['stage'] = 'submission'
         try:
             row = github.submit(job, payload)
             if not verified_review(row, job, config.actor):
                 row = reconcile(github, job, config.actor)
         except AmbiguousWrite:
+            context['stage'] = 'reconciliation'
             row = reconcile(github, job, config.actor)
         store.record_review(job, config.actor, row)
         current = github.pr(job['repo'], job['number'])
@@ -739,5 +789,9 @@ def review_one(config, store, github, reviewer, job):
     except HeadMoved as error:
         moved(error.current)
     except (Incomplete, ConfigError, GitHubError, FileNotFoundError, KeyError, TypeError, ValueError) as error:
+        diagnostics.emit('review_failed', warning=True, error_type=type(error).__name__)
         reason = str(error) if isinstance(error, (Incomplete, ConfigError)) else type(error).__name__ + '; required GitHub evidence is unavailable.'
         hold(reason)
+    finally:
+        diagnostics.emit('review_finished', status=job['status'], elapsed_ms=diagnostics.elapsed(started))
+        diagnostics.CONTEXT.reset(token)

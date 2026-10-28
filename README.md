@@ -205,6 +205,10 @@ Only a genuinely invalid Google grant requires explicit repair with `auth.py aut
 
 Preserve the SQLite database and its WAL files together when backing up. Deleting state can lose pending work and deduplication history. A failed Chat delivery does not repeat a successful GitHub review.
 
+The rotating activity log includes structured diagnostics for review start/finish, model run start/finish, and failed GitHub requests. Entries identify the job, PR, captured SHAs, stage, model run ID and elapsed milliseconds when available. GitHub failures include the method, known endpoint without query parameters, HTTP status, CLI exit code and a fixed error category. Model failures distinguish process exit, missing/oversized output and malformed JSON; recognized provider errors become categories such as `rate_limited` or `authentication`.
+
+Successful polls and GitHub reads stay quiet. Diagnostics never retain raw stderr, response bodies, headers, tokens, prompts, source code, findings or private Chat text. Unknown errors remain `unknown` rather than copying arbitrary provider text into the log. Existing usage accounting stays in SQLite. Inspect diagnostics with `tail -f .runtime/activity.log`; logging does not add retries or relax any publishing checks.
+
 ## Development
 
 | File | Responsibility |
