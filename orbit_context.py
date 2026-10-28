@@ -119,6 +119,7 @@ def audit(directory, evidence):
         raise ValueError('Invalid context audit job identifier.')
     data = {'head': evidence.head, 'base': evidence.base, 'merge_base': evidence.ancestor,
             'main': evidence.context_refs.get(evidence.repo + ':main'), 'scope': evidence.scope,
+            'services': getattr(evidence, 'services', {}),
             'profiles': sorted(evidence.references), 'sources': evidence.provenance,
             'context_refs': evidence.context_refs, 'dependencies': evidence.dependencies,
             'documents': sorted(evidence.documents),
