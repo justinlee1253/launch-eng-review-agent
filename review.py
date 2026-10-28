@@ -47,6 +47,10 @@ COMPACT_SOURCE_NOTE = (
 class Incomplete(Exception):
     """Evidence cannot support a completed verdict."""
 
+    def __init__(self, message, *, blocking_review=None):
+        super().__init__(message)
+        self.blocking_review = blocking_review
+
 
 class ReviewTimedOut(Incomplete):
     pass
@@ -1035,11 +1039,11 @@ def review_one(config, store, github, reviewer, job):
             raise Cancelled()
 
     github.cancel_guard = reviewer.cancel_guard = cancel_guard
-    def hold(reason, diagnostic=None):
+    def hold(reason, diagnostic=None, blocking_review=None):
         reserved = job['status'] in {'submitting', 'ambiguous'} and bool(job.get('payload'))
         if reserved:
             store.update(job, ready_after=time.time() + 60)
-        store.finish(job, 'ambiguous' if reserved else 'needs-attention', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\nReview held — {reason}", diagnostic=diagnostic)
+        store.finish(job, 'ambiguous' if reserved else 'needs-attention', f"{job['repo']}#{job['number']} · https://github.com/{job['repo']}/pull/{job['number']}\nReview held — {reason}", diagnostic=diagnostic, blocking_review=blocking_review)
 
     def moved(current, after=False):
         if current['head']['sha'] == job['head'] and current['base']['sha'] == job['base']:
@@ -1104,12 +1108,13 @@ def review_one(config, store, github, reviewer, job):
         if store.reviewed(job['repo'], job['number'], job['head'], config.actor):
             raise Incomplete('Ledger records this head, but its effective review is missing or dismissed; manual decision required.')
         latest_by_actor = {row['user']['login']: row for row in effective}
-        if any(row.get('state') == 'CHANGES_REQUESTED' and '<!-- justin-falcon-review:' not in (row.get('body') or '')
-               for row in latest_by_actor.values()):
-            raise Incomplete('Justin has a manual blocking review; do not overwrite that decision automatically.')
-        if any(row.get('user', {}).get('login') in JUSTIN and row.get('state') in {'COMMENTED', 'PENDING'}
-               and row.get('commit_id') == job['head'] and '<!-- justin-falcon-review:' not in (row.get('body') or '') for row in reviews):
-            raise Incomplete('Justin has an unfinished manual review at this head; ownership of the decision needs attention.')
+        for row in latest_by_actor.values():
+            if row.get('state') == 'CHANGES_REQUESTED' and '<!-- justin-falcon-review:' not in (row.get('body') or ''):
+                raise Incomplete('Justin has a manual blocking review; do not overwrite that decision automatically.', blocking_review=row)
+        for row in reviews:
+            if (row.get('user', {}).get('login') in JUSTIN and row.get('state') in {'COMMENTED', 'PENDING'}
+                    and row.get('commit_id') == job['head'] and '<!-- justin-falcon-review:' not in (row.get('body') or '')):
+                raise Incomplete('Justin has an unfinished manual review at this head; ownership of the decision needs attention.', blocking_review=row)
         ci = require_ready(github, job, pr)
         if not pr.get('changed_files', 1):
             raise WaitForCI('No changed files; no review is needed.')
@@ -1209,7 +1214,7 @@ def review_one(config, store, github, reviewer, job):
             exception_frames=[{'file': Path(frame.filename).name, 'line': frame.lineno, 'function': frame.name}
                               for frame in traceback.extract_tb(error.__traceback__)])
         reason = str(error) if isinstance(error, (Incomplete, ConfigError)) else type(error).__name__ + '; required GitHub evidence is unavailable.'
-        hold(reason, diagnostic)
+        hold(reason, diagnostic, getattr(error, 'blocking_review', None))
     finally:
         diagnostics.emit('review_finished', status=job['status'], elapsed_ms=diagnostics.elapsed(started))
         diagnostics.CONTEXT.reset(token)

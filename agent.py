@@ -460,9 +460,9 @@ class Store:
                             (*values.values(), job['id']))
         job.update(values)
 
-    def finish(self, job, status, text, reaction='warning', *, diagnostic=None):
+    def finish(self, job, status, text, reaction='warning', *, diagnostic=None, blocking_review=None):
         if reaction in (None, 'warning') or status in {'waiting_ci', 'needs-attention', 'deferred', 'ambiguous', 'cancelled', 'skipped'}:
-            text = chat_messages.warning(job, status, text, diagnostic=diagnostic)
+            text = chat_messages.warning(job, status, text, diagnostic=diagnostic, blocking_review=blocking_review)
         emoji = self.reactions[reaction]
         with self.db:
             self._require_owner(job)

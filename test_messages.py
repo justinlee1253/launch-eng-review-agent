@@ -63,6 +63,30 @@ class MessageTests(unittest.TestCase):
         self.assertNotIn('No review posted', text)
         self.assertNotIn('No GitHub review was posted', text)
 
+    def test_blocking_review_uses_canonical_link_without_copying_review_body(self):
+        row = {'id': 99, 'user': {'login': 'justinlee1253'}, 'state': 'CHANGES_REQUESTED',
+               'html_url': 'https://untrusted.example/review', 'body': 'PRIVATE REVIEW CONTENT'}
+        text = agent.chat_messages.warning(self.job, 'needs-attention',
+            'Justin has a manual blocking review', blocking_review=row)
+        self.assertIn('#pullrequestreview-99|Read the blocking review>', text)
+        self.assertNotIn('untrusted.example', text)
+        self.assertNotIn('PRIVATE REVIEW CONTENT', text)
+        self.assertIn('No review posted.', text)
+        for invalid in ({'id': '99'}, {'user': {'login': '<users/123>'}}, {'state': 'DISMISSED'}):
+            with self.subTest(invalid=invalid):
+                text = agent.chat_messages.warning(self.job, 'needs-attention',
+                    'Justin has a manual blocking review', blocking_review={**row, **invalid})
+                self.assertIn('An existing manual review or changed review decision needs attention.', text)
+                self.assertNotIn('Read the blocking review', text)
+
+    def test_blocking_review_does_not_override_unconfirmed_submission_warning(self):
+        row = {'id': 99, 'user': {'login': 'justinlee1253'}, 'state': 'CHANGES_REQUESTED'}
+        text = agent.chat_messages.warning(self.job, 'ambiguous',
+            'Justin has a manual blocking review', blocking_review=row)
+        self.assertIn('GitHub result unconfirmed', text)
+        self.assertNotIn('stopped before code analysis', text)
+        self.assertNotIn('agent.py retry', text)
+
     def test_size_holds_do_not_claim_an_existing_manual_review(self):
         reasons = [
             'Evidence exceeds the pilot context budget; manual review is required.',
