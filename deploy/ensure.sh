@@ -61,14 +61,17 @@ path.chmod(0o600)
 PYEOF
 fi
 
-# 7. Start the worker detached if it is not already running (the worker also holds a process lock).
-if ! pgrep -f "$ROOT/agent.py run" >/dev/null 2>&1; then
-  setsid nohup "$PY" "$ROOT/agent.py" run >> "$RUNTIME/agent.out" 2>&1 < /dev/null &
-  sleep 4
+# 7. Start the supervisor detached if it is not already running. It restarts the worker within seconds of a
+#    crash, so the hourly Routine only has to cover a replaced container. The worker also holds a process lock.
+if ! pgrep -f "$ROOT/deploy/supervise.sh" >/dev/null 2>&1; then
+  setsid nohup bash "$ROOT/deploy/supervise.sh" >/dev/null 2>&1 < /dev/null &
+  sleep 5
   pgrep -f "$ROOT/agent.py run" >/dev/null 2>&1 || { tail -n 5 "$RUNTIME/agent.out" >&2; fail "worker exited at startup."; }
-  echo "ensure: worker started as GitHub '$login'."
-else
+  echo "ensure: supervisor and worker started as GitHub '$login'."
+elif pgrep -f "$ROOT/agent.py run" >/dev/null 2>&1; then
   echo "ensure: worker already running as GitHub '$login'."
+else
+  echo "ensure: supervisor running, worker restarting (see .runtime/agent.out)."
 fi
 
 # 8. Health summary (non-secret).

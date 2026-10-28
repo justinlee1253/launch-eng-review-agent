@@ -57,6 +57,16 @@ Open the cloud environment menu in the session title bar, then Edit.
 
 **Falcon skill**: the review refuses to run without it. Commit it at `skills/avengers-falcon/SKILL.md` in the deployment repository (it is not in the public source).
 
+## Recovery timing
+
+| Event | Detected and recovered by | Typical delay |
+| --- | --- | --- |
+| New request in the Chat space | The worker's own 2-second poll | 2 s |
+| Worker process crash | `deploy/supervise.sh`, started by `ensure.sh` | 10 s (60 s if it died within its first minute, which points at configuration) |
+| Container replaced or process tree lost | The hourly Routine, or a `/loop 15m` check started in the session | up to 15 min with the loop, up to 1 h without |
+
+Routines cannot fire more often than hourly by default. `/loop` can go as low as one minute but each tick is a model turn and it only exists while the session does, so 15 minutes is the sensible setting.
+
 ## Start
 
 Start a new cloud session on the deployment repository after the settings above are saved, and ask Claude to deploy. It attaches `ROKT/launch-engineering` with push access, runs `bash deploy/ensure.sh`, then creates the hourly Routine. Verify with a real request in the Chat space: a 👀 reaction and a threaded acknowledgment, then a GitHub review under the configured account.
