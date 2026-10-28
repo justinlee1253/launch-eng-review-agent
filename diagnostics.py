@@ -18,7 +18,7 @@ PROVIDER_CODES = ('context_length_exceeded', 'insufficient_quota', 'rate_limit_e
                   'invalid_api_key', 'model_not_found', 'invalid_json_schema',
                   'invalid_request_error', 'server_error', 'usage_limit_exceeded',
                   'refresh_token_reused', 'refresh_token_expired', 'unsupported_model',
-                  'request_too_large', 'invalid_model', 'insufficient_permissions')
+                  'request_too_large', 'input_too_large', 'invalid_model', 'insufficient_permissions')
 
 
 @lru_cache(maxsize=4)
@@ -102,7 +102,8 @@ def error_category(raw, http_status=None):
     if isinstance(raw, bytes):
         raw = raw.decode('utf-8', errors='replace')
     text = raw.lower()
-    if any(value in text for value in ('context_length_exceeded', 'context window', 'maximum context length', 'request_too_large')):
+    if any(value in text for value in ('context_length_exceeded', 'context window', 'maximum context length',
+                                       'request_too_large', 'input_too_large', 'input exceeds the maximum length')):
         return 'context_limit'
     if any(value in text for value in ('invalid_json_schema', 'invalid schema', 'invalid_json')):
         return 'invalid_schema'
