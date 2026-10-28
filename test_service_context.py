@@ -156,6 +156,39 @@ class ServiceContextTests(unittest.TestCase):
                 self.assertIn(doc, service_context.topics('prism-qa', [path]))
         self.assertEqual(service_context.topics('prism-qa', ['prism-qa/README.md']), [])
 
+    def test_sentinel_change_loads_its_reference_and_context(self):
+        (self.references / 'ad-sentinel.md').write_text('sentinel-reference-marker')
+        suppression = 'ad-sentinel/ad_sentinel/controllers/suppression.py'
+        _, evidence = self.capture(path=suppression, docs={
+            (HEAD, 'ad-sentinel/README.md'): 'sentinel-readme',
+            (HEAD, 'ad-sentinel/infra/kube/ad-sentinel/values.yaml'): 'smbSegment:\n  dryRun: "no"\n'})
+        self.assertEqual(set(evidence.services), {'ad-sentinel'})
+        self.assertIn('sentinel-reference-marker', evidence.references['ad-sentinel'])
+        loaded = evidence.services['ad-sentinel']['loaded_docs']
+        self.assertIn('ad-sentinel/infra/kube/ad-sentinel/values.yaml', loaded)
+        self.assertIn(suppression, loaded)
+        self.assertNotIn('ad-sentinel/ad_sentinel/controllers/db.py', loaded)
+
+    def test_context_file_with_credential_is_withheld_from_prompt(self):
+        (self.references / 'ad-sentinel.md').write_text('sentinel-reference-marker')
+        secret = 'https://chat.googleapis.com/v1/spaces/X/messages?key=' + 'A' * 39 + '&token=' + 'b' * 43
+        remote, evidence = self.capture(path='ad-sentinel/ad_sentinel/controllers/suppression.py', docs={
+            (HEAD, 'ad-sentinel/infra/kube/ad-sentinel/values.yaml'): 'webhook: "' + secret + '"\n'})
+        profile = evidence.services['ad-sentinel']
+        self.assertEqual(profile['withheld_docs'], ['ad-sentinel/infra/kube/ad-sentinel/values.yaml'])
+        self.assertNotIn('A' * 39, self.prompt(remote, evidence))
+
+    def test_project_key_argument_is_not_a_credential(self):
+        for line in ('JiraChannel(self._jira_client(), project_key=JIRA_OSD_TEST_PROJECT_KEY)',
+                     'task.add_done_callback(lambda _, key=jira_issue_key_for_autoclose: discard(key))'):
+            self.assertIsNone(service_context.CREDENTIAL.search(line))
+
+    def test_pr_touching_two_services_loads_both(self):
+        (self.references / 'ad-sentinel.md').write_text('sentinel-reference-marker')
+        selected = service_context.select('ROKT/launch-engineering', [
+            {'filename': TELEMETRY}, {'filename': 'ad-sentinel/README.md'}], {})
+        self.assertEqual(set(selected), {'prism-qa', 'ad-sentinel'})
+
     def test_real_reference_files_exist_for_every_profile(self):
         for service, profile in service_context.PROFILES.items():
             with self.subTest(service=service):
