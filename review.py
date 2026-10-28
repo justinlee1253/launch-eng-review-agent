@@ -16,6 +16,7 @@ import time
 from agent import ConfigError, REPOS, ROOT, Store
 import usage
 import orbit_context
+import service_context
 import review_drafts
 from queue_controls import Cancelled
 
@@ -376,6 +377,11 @@ class GitHub:
                 optional.add('Orbit/orbit/orbit/sources/README.md')
             for path in sorted(optional):
                 evidence.read(self, repo, head, path, optional=True)
+        for service, paths in service_context.select(repo, files, patches).items():
+            try:
+                service_context.load(evidence, self, service, paths, MAX_CONTEXT)
+            except (OSError, ValueError):
+                raise Incomplete('Required ' + service + ' review reference is unavailable.') from None
         if any(path.startswith('src/UI/MP.UI.Web.Admin/') for path in evidence.files):
             evidence.read(self, repo, head, 'src/UI/MP.UI.Web.Admin/AGENTS.md')
         current = self.pr(repo, number)
@@ -404,10 +410,13 @@ class Evidence:
         self.context_refs = {repo: head}
         self.job_id, self.ci = None, None
         self.references, self.local_documents, self.dependencies = {}, {}, {}
-        self.provenance, self.scope = [], None
+        self.provenance, self.scope, self.services = [], None, {}
+
+    def size(self):
+        return len(json.dumps(self.as_dict())) + sum(len(text) for text in self.references.values())
 
     def check_budget(self):
-        if len(json.dumps(self.as_dict())) + sum(len(text) for text in self.references.values()) > MAX_CONTEXT:
+        if self.size() > MAX_CONTEXT:
             raise Incomplete('Evidence exceeds the pilot context budget; manual review is required.')
 
     def as_dict(self):
@@ -415,7 +424,8 @@ class Evidence:
                 'changed_files': self.files, 'complete_diff': self.diff, 'documents': self.documents,
                 'trusted_context': self.instructions, 'pr_description_untrusted': self.description,
                 'context_refs': self.context_refs, 'reported_ci': self.ci,
-                'context_provenance': self.provenance, 'review_scope': self.scope, 'dependencies': self.dependencies}
+                'context_provenance': self.provenance, 'review_scope': self.scope, 'dependencies': self.dependencies,
+                'service_profiles': self.services}
 
     def pin_main(self, github, repo):
         key = repo + ':main'

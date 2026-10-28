@@ -117,6 +117,14 @@ files or a page from the fixed local topic allowlist. Missing required context h
 review. Local summaries record their compiled SHA against pinned main and remain discovery
 context, not proof that a proposal is merged or deployed.
 
+Other services get a profile in [service_context.py](service_context.py), selected the same
+way by path (`prism-qa/` today). A profile adds the service's review reference from
+[references/](references) and its own docs from the repository at the captured head: a small
+baseline, plus the topic docs whose code the PR changes. Topic docs that would leave less than
+400,000 characters of context budget are listed as `deferred_docs` for the model to request
+instead of holding the review. A missing bundled reference holds the review. The reference is
+versioned with this repository, so its hash in the context audit identifies the rules applied.
+
 A necessary companion PR can be read with `ref=pr/NUMBER`; its head is pinned and its
 merged/proposed/closed state is explicit. A changed dependency prevents publishing a verdict
 based on obsolete evidence. The repository allowlist and publishing permissions stay the same.
@@ -255,6 +263,7 @@ Preserve the SQLite database and its WAL files together when backing up. Deletin
 | [auth.py](auth.py) | Explicit Google authorization, Keychain storage, silent renewal, and pause behavior. |
 | [review.py](review.py) | Fixed-commit evidence, bounded model analysis, validation, and GitHub publishing. |
 | [review-policy.md](review-policy.md), [review.schema.json](review.schema.json) | Review instructions and structured result contract. |
+| [service_context.py](service_context.py), [references/](references) | Per-service review profiles: path selection, doc mapping and bundled rules. |
 | [usage.py](usage.py) | Model settings, reported token accounting, and reference credit estimates. |
 | [launch_agent.py](launch_agent.py) | Login service definition and controlled installation. |
 
