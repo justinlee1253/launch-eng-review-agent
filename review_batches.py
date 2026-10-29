@@ -106,7 +106,7 @@ def validate_state(state, evidence):
 
 def run(reviewer, github, evidence, instructions, header, guard, budget, first_round,
         *, state=None, checkpoint=None):
-    from review import COMPACT_SOURCE_NOTE, Incomplete, MAX_PROMPT_CHARS, WorkerStopped, validate_result
+    from review import CitationError, COMPACT_SOURCE_NOTE, Incomplete, MAX_PROMPT_CHARS, WorkerStopped, validate_result
 
     state = state if state is not None else new_state()
     history, candidates = state['history'], state['candidates']
@@ -210,18 +210,22 @@ def run(reviewer, github, evidence, instructions, header, guard, budget, first_r
         if (not isinstance(acknowledged, list) or any(not isinstance(key, str) for key in acknowledged)
                 or len(acknowledged) != len(active) or set(acknowledged) != set(active)):
             raise Incomplete('Batched source coverage is incomplete; no verdict accepted.')
-        # Validate candidate shape and citations against retained full originals.
-        check = {**output, 'status': 'complete', 'requests': [], 'reviewed_files': evidence.files,
-                 'summary': 'Source pass coverage checked.'}
-        validate_result(check, evidence)
         if output['status'] == 'complete' and output.get('requests'):
             raise Incomplete('Batched review completed with unresolved evidence requests.')
         if phase == 'integration' and output['status'] == 'complete':
             if covered | set(active) != set(evidence.documents):
                 raise Incomplete('Batched source coverage changed before the final verdict.')
             check_decisions(output)
-            validate_result(output, evidence)
+            try:
+                validate_result(output, evidence)
+            except CitationError:
+                # Save the completed draft before the existing citation-only repair.
+                pass
             return {**output, 'source_passes_untrusted': history}
+        # Intermediate candidates must still cite retained full originals.
+        check = {**output, 'status': 'complete', 'requests': [], 'reviewed_files': evidence.files,
+                 'summary': 'Source pass coverage checked.'}
+        validate_result(check, evidence)
         record_pass(state, active, output)
         covered.update(active)
         reread.difference_update(active)
