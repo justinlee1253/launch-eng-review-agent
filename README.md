@@ -197,6 +197,19 @@ Polling and reaction settings live in `.runtime/config.json`. The current suppor
 
 These keys belong under `reactions`. Preserve the configured space, activation timestamp, and database when changing presentation settings. Restart the process after editing configuration.
 
+Each value can also be a Google Chat custom emoji resource, such as
+`customEmojis/66314228-e590-4a70-9990-ac6fc282ec13`. Upload the image in Chat
+first and use its resource ID, rather than its `:display-name:` or a local
+image path. Custom emoji reactions use the existing reaction permissions.
+Status transitions remove the agent's previous Unicode or custom status;
+other people's reactions and unrelated emojis are preserved.
+
+All four statuses support custom emojis. The local alien set maps `picked_up`
+to `:alien-acknowledged:`, `approved` to `:alien-approved:`,
+`changes_requested` to `:alien-requested-changes:`, and `warning` to
+`:alien-warning:`. Store their `customEmojis/ID` values in the local runtime
+configuration; the display names above are labels, not configuration values.
+
 ### Enable login startup
 
 After a real pilot request has completed successfully, stop the foreground process and install the macOS LaunchAgent:

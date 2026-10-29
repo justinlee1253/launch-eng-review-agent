@@ -9,6 +9,73 @@ from test_agent import SPACE, START, END, message
 REACTION_SCOPE = 'https://www.googleapis.com/auth/chat.messages.reactions'
 
 class ReactionTests(unittest.TestCase):
+    def test_custom_acknowledgement_transitions_to_final_status(self):
+        reactions = {**agent.REACTIONS, 'picked_up': 'customEmojis/alien-acknowledged'}
+        config = agent.Config(SPACE, START, reactions=reactions)
+        self.store.reactions = reactions
+        self.store.ingest(config, [message()], START, END, None)
+        payload = json.loads(self.store.db.execute("select payload from outbox where kind='reaction'").fetchone()[0])
+        self.assertEqual(payload['emoji'], {'customEmoji': {'name': reactions['picked_up']}})
+        job = self.store.claim()
+        self.store.finish(job, 'submitted', 'Clean', 'approved')
+        payload = json.loads(self.store.db.execute("select payload from outbox where kind='reaction'").fetchone()[0])
+        self.assertEqual(payload['emoji'], {'unicode': '✅'})
+        self.assertIn(reactions['picked_up'], payload['managed_emojis'])
+
+    def test_custom_emoji_configuration_and_validation(self):
+        reactions = {**agent.REACTIONS, 'approved': 'customEmojis/alien-approved'}
+        self.assertEqual(agent.Config(SPACE, START, reactions=reactions).reactions, reactions)
+        for invalid in ('customEmojis/', 'customEmojis/../other', ':alien-approved:'):
+            with self.subTest(invalid=invalid), self.assertRaises(agent.ConfigError):
+                agent.Config(SPACE, START, reactions={**reactions, 'approved': invalid})
+
+    def test_custom_status_replaces_unicode_and_survives_restart(self):
+        target = message()['name']
+        custom = 'customEmojis/alien-approved'
+        with self.store.db:
+            self.store._reaction(target, '✅')
+            self.store._reaction(target, custom)
+        payload = json.loads(self.store.db.execute("select payload from outbox where kind='reaction'").fetchone()[0])
+        self.assertEqual(payload['emoji'], {'customEmoji': {'name': custom}})
+        self.assertIn('✅', payload['managed_emojis'])
+        self.store.db.close()
+        self.store = agent.Store(Path(self.tmp.name) / 'state.sqlite3')
+        self.addCleanup(self.store.db.close)
+        with self.store.db:
+            self.store._reaction(target, '👀')
+        payload = json.loads(self.store.db.execute("select payload from outbox where kind='reaction'").fetchone()[0])
+        self.assertIn(custom, payload['managed_emojis'])
+
+    def test_custom_reaction_delivery_preserves_others_and_is_idempotent(self):
+        target = message()['name']
+        custom = 'customEmojis/alien-approved'
+        emoji = {'customEmoji': {'name': custom}}
+        reactions = [
+            {'name': target + '/reactions/old', 'user': {'name': self.config.self_user}, 'emoji': {'unicode': '✅'}},
+            {'name': target + '/reactions/theirs', 'user': {'name': 'users/other'}, 'emoji': emoji},
+            {'name': target + '/reactions/unrelated', 'user': {'name': self.config.self_user}, 'emoji': {'customEmoji': {'name': 'customEmojis/unrelated'}}},
+        ]
+        chat = agent.Chat(self.config, manager=object())
+        chat.credentials = type('Credentials', (), {'scopes': [REACTION_SCOPE], 'granted_scopes': None})()
+        posts = []
+        def request(method, resource, **options):
+            if method == 'GET':
+                return {'reactions': reactions}
+            if method == 'DELETE':
+                reactions[:] = [r for r in reactions if r['name'] != resource]
+                return {}
+            posts.append(options['json'])
+            row = {'name': target + '/reactions/new', 'user': {'name': self.config.self_user},
+                   'emoji': {'customEmoji': {'name': custom, 'uid': 'alien-approved'}}}
+            reactions.append(row)
+            return row
+        chat.request = request
+        payload = {'emoji': emoji, 'managed_emojis': ['✅', custom]}
+        chat.sync_reaction(target, payload)
+        chat.sync_reaction(target, payload)
+        self.assertEqual(posts, [{'emoji': emoji}])
+        self.assertEqual({r['name'].rsplit('/', 1)[-1] for r in reactions}, {'theirs', 'unrelated', 'new'})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
