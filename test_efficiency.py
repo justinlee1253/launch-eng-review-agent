@@ -68,12 +68,11 @@ class EfficiencyTests(unittest.TestCase):
         self.store.release(first)
         self.assertEqual(self.store.claim()['number'], 6000)
 
-    def test_failed_pending_conflicted_and_draft_prs_do_not_start_the_model(self):
-        for setting in ('failed', 'pending', 'conflicted', 'draft'):
+    def test_failed_pending_and_conflicted_prs_do_not_start_the_model(self):
+        for setting in ('failed', 'pending', 'conflicted'):
             with self.subTest(setting=setting):
                 msg = message(setting, text='https://github.com/ROKT/launch-engineering/pull/' + str(6100 + len(self.store.history())))
                 job = self.enqueue(msg)
-                self.github.data['draft'] = setting == 'draft'
                 self.github.data['mergeable_state'] = 'dirty' if setting == 'conflicted' else 'clean'
                 self.github.ci = lambda *args: {'state': setting if setting in {'failed', 'pending'} else 'passed', 'checks': ['buildkite/pipeline']}
                 review.review_one(self.config, self.store, self.github, NoModel(), job)

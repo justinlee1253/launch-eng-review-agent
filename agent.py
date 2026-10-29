@@ -140,6 +140,10 @@ class Store:
                 repo text, number integer, head text, actor text,
                 review_id integer, review_url text, event text,
                 primary key(repo,number,head,actor));
+            create table if not exists draft_feedback(
+                repo text, number integer, head text, actor text,
+                review_id integer, review_url text, event text,
+                primary key(repo,number,head,actor));
             create table if not exists events(
                 id integer primary key, at text not null, job text,
                 code text not null, unique_key text unique);
@@ -220,9 +224,9 @@ class Store:
             return
         if any(r['status'] in {'queued', 'reviewing', 'submitting', 'ambiguous'} for r in rows):
             outcome = 'picked_up'
-        elif any(r['outcome'] not in {'approved', 'changes_requested'} for r in rows):
+        elif any(r['outcome'] not in {'approved', 'changes_requested', 'feedback'} for r in rows):
             outcome = 'warning'
-        elif any(r['outcome'] == 'changes_requested' for r in rows):
+        elif any(r['outcome'] in {'changes_requested', 'feedback'} for r in rows):
             outcome = 'changes_requested'
         else:
             outcome = 'approved'
@@ -255,6 +259,9 @@ class Store:
 
     def reserve_submission(self, job, payload, marker):
         # Serialize cancellation with the last local step before an external write.
+        feedback = job.get('mode') == 'draft_feedback'
+        if payload.get('event') not in ({'COMMENT'} if feedback else {'APPROVE', 'REQUEST_CHANGES'}):
+            raise ConfigError('Draft feedback may publish only a comment; formal reviews require a verdict.')
         with self.db:
             self.db.execute('begin immediate')
             self._require_owner(job)
@@ -401,7 +408,7 @@ class Store:
                                        (name, repo, number)).fetchone():
                         continue
                     first = self.first_request({'repo': repo, 'number': number})
-                    job = self.db.execute("select * from jobs where repo=? and number=? and status in ('queued','reviewing','waiting_ci','submitting','ambiguous') order by requested_at limit 1",
+                    job = self.db.execute("select * from jobs where repo=? and number=? and status in ('queued','reviewing','waiting_ci','submitting','ambiguous') and mode<>'draft_feedback' order by requested_at limit 1",
                                           (repo, number)).fetchone()
                     if job:
                         id = job['id']
@@ -419,7 +426,7 @@ class Store:
                     if first:
                         acknowledgment = chat_messages.duplicate(job, original or first) if job else (
                             ('STAMP received — checking the latest commit; approval without code review. ' if mode == 'stamp' else
-                             'Re-review request received — checking for a new commit. ') + chat_messages.original_request(first))
+                             'Re-review request received — checking the current PR state. ') + chat_messages.original_request(first))
                     acknowledgment += queue_eta.describe(self, id)
                     self._outbox('ack:' + name, 'message', thread,
                                  {'text': acknowledgment, 'thread': {'name': thread}})
@@ -450,7 +457,7 @@ class Store:
             return dict(row, owner=owner)
 
     def update(self, job, **values):
-        allowed = {'status', 'head', 'base', 'payload', 'marker', 'review_id', 'review_url', 'result', 'ready_after', 'head_moves'}
+        allowed = {'status', 'head', 'base', 'payload', 'marker', 'review_id', 'review_url', 'result', 'ready_after', 'head_moves', 'mode'}
         if not set(values).issubset(allowed):
             raise ValueError('Invalid job update')
         values['updated_at'] = utc()
@@ -464,26 +471,29 @@ class Store:
         if reaction in (None, 'warning') or status in {'waiting_ci', 'needs-attention', 'deferred', 'ambiguous', 'cancelled', 'skipped'}:
             text = chat_messages.warning(job, status, text, diagnostic=diagnostic, blocking_review=blocking_review)
         emoji = self.reactions[reaction]
+        outcome = 'feedback' if status == 'feedback' else reaction
         with self.db:
             self._require_owner(job)
-            self.db.execute('update jobs set status=?,result=?,outcome=?,owner=null,updated_at=? where id=?', (status, text, reaction, utc(), job['id']))
+            self.db.execute('update jobs set status=?,result=?,outcome=?,owner=null,updated_at=? where id=?', (status, text, outcome, utc(), job['id']))
             self.event(status, job['id'], unique=job['id'] + ':' + status + ':' + hashlib.sha256(text.encode()).hexdigest())
             for source in self.db.execute('select * from sources where job=?', (job['id'],)).fetchall():
                 key = job['id'] + ':' + hashlib.sha256(text.encode()).hexdigest() + ':' + source['thread']
                 self._outbox('result:' + key, 'message', source['thread'],
                              {'text': text, 'thread': {'name': source['thread']}})
             self._pr_reaction(job, emoji)
-        job.update(status=status, result=text, outcome=reaction, owner=None)
+        job.update(status=status, result=text, outcome=outcome, owner=None)
 
-    def reviewed(self, repo, number, head, actor):
-        row = self.db.execute('select * from ledger where repo=? and number=? and head=? and actor=?',
+    def reviewed(self, repo, number, head, actor, *, feedback=False):
+        table = 'draft_feedback' if feedback else 'ledger'
+        row = self.db.execute('select * from ' + table + ' where repo=? and number=? and head=? and actor=?',
                               (repo, number, head, actor)).fetchone()
         return dict(row) if row else None
 
     def record_review(self, job, actor, review):
         with self.db:
             self._require_owner(job)
-            self.db.execute('insert or replace into ledger values(?,?,?,?,?,?,?)',
+            table = 'draft_feedback' if job.get('mode') == 'draft_feedback' else 'ledger'
+            self.db.execute('insert or replace into ' + table + ' values(?,?,?,?,?,?,?)',
                             (job['repo'], job['number'], job['head'], actor, review['id'], review['html_url'], review['state']))
             self.db.execute('update jobs set review_id=?,review_url=?,updated_at=? where id=?',
                             (review['id'], review['html_url'], utc(), job['id']))

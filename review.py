@@ -148,7 +148,7 @@ def ci_summary(statuses, checks):
 
 
 def require_ready(github, job, pr):
-    if pr['state'] != 'open' or pr.get('merged') or pr.get('draft'):
+    if pr['state'] != 'open' or pr.get('merged') or (pr.get('draft') and job.get('mode') != 'draft_feedback'):
         raise WaitForCI('PR is closed, merged, or draft; no review started.')
     if pr.get('mergeable_state') == 'dirty':
         raise WaitForCI('PR has merge conflicts. Resolve them and post the link again.')
@@ -181,7 +181,9 @@ def check_sha(value):
     return value
 
 
-def marker(repo, number, head, stamp=False):
+def marker(repo, number, head, stamp=False, *, feedback=False):
+    if feedback:
+        return f'<!-- justin-orbit-draft-feedback:{repo}#{number}:{head} -->'
     kind = 'stamp' if stamp else 'review'
     return f'<!-- justin-falcon-{kind}:{repo}#{number}:{head} -->'
 
@@ -441,6 +443,8 @@ class GitHub:
     def submit(self, job, payload):
         if job['repo'] not in REPOS:
             raise Incomplete('Publishing outside the review allowlist is forbidden.')
+        if job.get('mode') == 'draft_feedback' and payload.get('event') != 'COMMENT':
+            raise Incomplete('Draft feedback cannot approve or request changes.')
         directory = self.directory / 'payloads'
         directory.mkdir(mode=0o700, exist_ok=True)
         path = directory / (job['id'] + '-' + check_sha(payload['commit_id']) + '.json')
@@ -456,6 +460,7 @@ class Evidence:
         self.documents, self.old_paths, self.instructions, self.description = {}, {}, {}, {}
         self.context_refs = {repo: head}
         self.job_id, self.ci = None, None
+        self.feedback_only = False
         self.references, self.local_documents, self.dependencies = {}, {}, {}
         self.provenance, self.scope = [], None
 
@@ -471,7 +476,8 @@ class Evidence:
                 'changed_files': self.files, 'complete_diff': self.diff, 'documents': self.documents,
                 'trusted_context': self.instructions, 'pr_description_untrusted': self.description,
                 'context_refs': self.context_refs, 'reported_ci': self.ci,
-                'context_provenance': self.provenance, 'review_scope': self.scope, 'dependencies': self.dependencies}
+                'context_provenance': self.provenance, 'review_scope': self.scope, 'dependencies': self.dependencies,
+                'review_purpose': 'draft_feedback' if self.feedback_only else 'formal_review'}
 
     def for_prompt(self, *, compact_base=False, documents=None):
         # Keep the full capture for validation; alias only exactly identical source text.
@@ -812,7 +818,7 @@ class Reviewer:
         instructions_hash = review_drafts.digest([
             policy, skill, contract,
             hashlib.sha256((ROOT / 'review_batches.py').read_bytes()).hexdigest()])
-        archive = review_drafts.Drafts(self.directory)
+        archive = review_drafts.Drafts(self.directory, feedback=evidence.feedback_only)
         record = archive.latest(evidence.repo, evidence.number, evidence.head, evidence.base,
                                 include_progress=True)
         state = None
@@ -835,7 +841,8 @@ class Reviewer:
             record = None
 
         def guard():
-            job = {'repo': evidence.repo, 'number': evidence.number, 'head': evidence.head}
+            job = {'repo': evidence.repo, 'number': evidence.number, 'head': evidence.head,
+                   'mode': 'draft_feedback' if evidence.feedback_only else 'review'}
             current = github.pr(evidence.repo, evidence.number)
             if current['head']['sha'] != evidence.head or current['base']['sha'] != evidence.base:
                 raise HeadMoved(current)
@@ -989,7 +996,8 @@ def recover_citations(archive, record, reviewer, github, evidence):
         current = github.pr(evidence.repo, evidence.number)
         if current['head']['sha'] != evidence.head or current['base']['sha'] != evidence.base:
             raise HeadMoved(current)
-        require_ready(github, {'repo': evidence.repo, 'head': evidence.head}, current)
+        require_ready(github, {'repo': evidence.repo, 'head': evidence.head,
+                       'mode': 'draft_feedback' if evidence.feedback_only else 'review'}, current)
         evidence.check_dependencies(github)
 
     output = copy.deepcopy(record['current'])
@@ -1045,7 +1053,11 @@ def recover_citations(archive, record, reviewer, github, evidence):
 def review_payload(job, evidence, output):
     validate_result(output, evidence)
     blockers = sum(f['blocking'] for f in output['findings'])
-    body = ['## ' + ('Changes requested' if blockers else 'Approved'), '', chat_messages.paragraphs(output['summary'])]
+    feedback = job.get('mode') == 'draft_feedback'
+    heading = 'Draft feedback' if feedback else 'Changes requested' if blockers else 'Approved'
+    body = ['## ' + heading, '', chat_messages.paragraphs(output['summary'])]
+    if feedback:
+        body += ['', 'Feedback only; no approval or request-changes verdict is submitted.']
     comments = []
     for blocking, heading in [(True, 'Required fixes'), (False, 'Non-blocking concerns')]:
         items = [finding for finding in output['findings'] if finding['blocking'] == blocking]
@@ -1069,8 +1081,8 @@ def review_payload(job, evidence, output):
                 body += [text, location, '']
     body += ['', '**Reviewed commit:** `' + evidence.head + '`',
              '**Validation:** ' + chat_messages.validation(evidence.ci), 'Automated review by Orbit.',
-             '', marker(job['repo'], job['number'], evidence.head)]
-    return {'event': 'REQUEST_CHANGES' if blockers else 'APPROVE', 'commit_id': evidence.head,
+             '', marker(job['repo'], job['number'], evidence.head, feedback=feedback)]
+    return {'event': 'COMMENT' if feedback else 'REQUEST_CHANGES' if blockers else 'APPROVE', 'commit_id': evidence.head,
             'body': '\n'.join(body), 'comments': comments}
 
 
@@ -1081,7 +1093,10 @@ def own_timeline(rows):
 
 def verified_review(row, job, actor):
     event = json.loads(job['payload'])['event']
-    expected = 'APPROVED' if event == 'APPROVE' else 'CHANGES_REQUESTED'
+    states = {'COMMENT': 'COMMENTED'} if job.get('mode') == 'draft_feedback' else {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED'}
+    expected = states.get(event)
+    if expected is None:
+        return False
     url = f"https://github.com/{job['repo']}/pull/{job['number']}#pullrequestreview-{row.get('id')}"
     return (row.get('user', {}).get('login') == actor and row.get('commit_id') == job['head']
             and job['marker'] in row.get('body', '') and row.get('state') == expected
@@ -1152,30 +1167,40 @@ def review_one(config, store, github, reviewer, job):
             current = github.pr(job['repo'], job['number'])
             if moved(current, after=True):
                 return
-            store.finish(job, 'submitted', f"{job['repo']}#{job['number']} — reconciled {review['state']}.\nGitHub review: {review['html_url']}\nHead: {job['head']}",
+            feedback = job.get('mode') == 'draft_feedback'
+            store.finish(job, 'feedback' if feedback else 'submitted', f"{job['repo']}#{job['number']} — {'Draft feedback' if feedback else 'Review'} reconciled: {review['state']}.\nGitHub review: {review['html_url']}\nHead: {job['head']}",
                          'approved' if review['state'] == 'APPROVED' else 'changes_requested')
             return
         pr = github.pr(job['repo'], job['number'])
-        if pr['state'] != 'open' or pr.get('merged') or pr.get('user', {}).get('login') in JUSTIN:
+        feedback = not stamp and (job.get('mode') == 'draft_feedback' or bool(pr.get('draft')))
+        if pr['state'] != 'open' or pr.get('merged') or (pr.get('user', {}).get('login') in JUSTIN and not feedback):
             reason = 'The PR is merged' if pr.get('merged') else 'The PR is closed' if pr['state'] != 'open' else 'PR is authored by Justin; self-approval is excluded'
             store.finish(job, 'skipped', f"{job['repo']}#{job['number']} — Review held: {reason}; no review submitted.")
             return
-        if pr.get('draft'):
-            raise Incomplete('Draft PR; post the link again when it is ready for review.')
-        store.update(job, head=check_sha(pr['head']['sha']), base=check_sha(pr['base']['sha']))
+        if pr.get('draft') and stamp:
+            raise Incomplete('Draft PR; STAMP is unavailable until the PR is ready for review.')
+        store.update(job, head=check_sha(pr['head']['sha']), base=check_sha(pr['base']['sha']),
+                     mode='draft_feedback' if feedback else job['mode'])
         reviews = github.reviews(job['repo'], job['number'])
         comments = github.comments(job['repo'], job['number'])
         effective = [row for row in reviews if row.get('user', {}).get('login') in JUSTIN
                      and row.get('state') in {'APPROVED', 'CHANGES_REQUESTED'}]
         same_head = [row for row in effective if row.get('commit_id') == job['head']]
+        if feedback:
+            identity = {**job, 'payload': json.dumps({'event': 'COMMENT'}),
+                        'marker': marker(job['repo'], job['number'], job['head'], feedback=True)}
+            same_head = [row for row in reviews if verified_review(row, identity, config.actor)]
         if same_head:
             row = same_head[-1]
+            if feedback:
+                store.finish(job, 'feedback', f"{job['repo']}#{job['number']} — Draft feedback already shared for this commit.\n<{row['html_url']}|GitHub feedback> · Commit: {job['head'][:8]}", 'changes_requested')
+                return
             first = store.first_request(job)
             original = f" Original request: {first['created_at']}." if first else ''
             store.finish(job, 'skipped', f"{job['repo']}#{job['number']} — already handled at this head; no second review.{original}\nGitHub review: {row.get('html_url', '')}\nHead: {job['head']}",
                          'approved' if row['state'] == 'APPROVED' else 'changes_requested')
             return
-        if store.reviewed(job['repo'], job['number'], job['head'], config.actor):
+        if store.reviewed(job['repo'], job['number'], job['head'], config.actor, feedback=feedback):
             raise Incomplete('Ledger records this head, but its effective review is missing or dismissed; manual decision required.')
         latest_by_actor = {row['user']['login']: row for row in effective}
         for row in latest_by_actor.values():
@@ -1183,7 +1208,8 @@ def review_one(config, store, github, reviewer, job):
                 raise Incomplete('Justin has a manual blocking review; do not overwrite that decision automatically.', blocking_review=row)
         for row in reviews:
             if (row.get('user', {}).get('login') in JUSTIN and row.get('state') in {'COMMENTED', 'PENDING'}
-                    and row.get('commit_id') == job['head'] and '<!-- justin-falcon-review:' not in (row.get('body') or '')):
+                    and row.get('commit_id') == job['head'] and not any(tag in (row.get('body') or '')
+                    for tag in ('<!-- justin-falcon-review:', '<!-- justin-orbit-draft-feedback:'))):
                 raise Incomplete('Justin has an unfinished manual review at this head; ownership of the decision needs attention.', blocking_review=row)
         ci = require_ready(github, job, pr)
         if not pr.get('changed_files', 1):
@@ -1196,7 +1222,7 @@ def review_one(config, store, github, reviewer, job):
         else:
             context['stage'] = 'draft_recovery'
             store.processing(job)
-            archive = review_drafts.Drafts(store.path.parent)
+            archive = review_drafts.Drafts(store.path.parent, feedback=feedback)
             record = archive.latest(job['repo'], job['number'], job['head'], job['base'], include_progress=True)
             if record:
                 evidence = restore_draft(record, job)
@@ -1212,6 +1238,7 @@ def review_one(config, store, github, reviewer, job):
                 context['stage'] = 'evidence_capture'
                 evidence = github.capture(job, pr)
                 evidence.job_id, evidence.ci, evidence.number = job['id'], ci, job['number']
+                evidence.feedback_only = feedback
                 evidence.description['existing_reviews_untrusted'] = reviews
                 evidence.description['inline_comments_untrusted'] = comments
                 evidence.check_budget()
@@ -1237,7 +1264,7 @@ def review_one(config, store, github, reviewer, job):
         if own_timeline(reviews) != own_timeline(latest_reviews) or own_timeline(comments) != own_timeline(latest_comments):
             raise Incomplete('An intervening Justin review/comment requires a manual decision.')
         current = github.pr(job['repo'], job['number'])
-        if current['state'] != 'open' or current.get('draft') or current.get('merged'):
+        if current['state'] != 'open' or (current.get('draft') and not feedback) or current.get('merged'):
             raise Incomplete('PR closed or became draft before submission; no review was posted.')
         if moved(current):
             return
@@ -1249,7 +1276,7 @@ def review_one(config, store, github, reviewer, job):
         if getattr(reviewer, 'stop', None) and reviewer.stop.is_set():
             raise WorkerStopped('Worker stopped; no review was submitted.')
         budget.remaining()
-        if not store.reserve_submission(job, payload, marker(job['repo'], job['number'], job['head'], stamp=stamp)):
+        if not store.reserve_submission(job, payload, marker(job['repo'], job['number'], job['head'], stamp=stamp, feedback=feedback)):
             raise Cancelled()
         context['stage'] = 'submission'
         try:
@@ -1267,8 +1294,12 @@ def review_one(config, store, github, reviewer, job):
         current = github.pr(job['repo'], job['number'])
         if moved(current, after=True):
             return
-        if current['state'] != 'open' or current.get('merged') or current.get('draft'):
-            store.finish(job, 'submitted', f"{job['repo']}#{job['number']} — Review submitted for {job['head'][:8]}, but the PR is now closed, merged, or draft.\nGitHub review: {row['html_url']}")
+        if current['state'] != 'open' or current.get('merged') or (current.get('draft') and not feedback):
+            kind = 'Draft feedback posted' if feedback else 'Review submitted'
+            store.finish(job, 'submitted', f"{job['repo']}#{job['number']} — {kind} for {job['head'][:8]}, but the PR is now closed, merged, or draft.\nGitHub review: {row['html_url']}")
+            return
+        if feedback:
+            store.finish(job, 'feedback', chat_messages.review_result(job, output, row['html_url'], ci, feedback=True), 'changes_requested')
             return
         store.finish(job, 'submitted', chat_messages.review_result(job, output, row['html_url'], ci, stamp=stamp),
                      'approved' if payload['event'] == 'APPROVE' else 'changes_requested')
