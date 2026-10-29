@@ -138,6 +138,52 @@ class BatchedReviewTests(unittest.TestCase):
                 'scenario': 'A lookup returns no user.', 'impact': 'The request fails.',
                 'evidence': 'return user.name', 'fix': 'Handle an absent user.'}
 
+    def test_final_citation_mismatch_is_saved_for_existing_repair_path(self):
+        finding = {**self.finding(), 'line': 165}
+        self.evidence.documents[self.prefix + 'handler.py'] += '\n' * 164
+
+        def model(prompt, **options):
+            data = self.data(prompt)
+            findings = [finding] if data['evidence_batch']['phase'] == 'integration' else []
+            return self.response(data, findings=findings)
+
+        output = self.run_review(model)
+        archive = review.review_drafts.Drafts(self.tmp.name)
+        record = archive.latest(self.evidence.repo, self.evidence.number,
+                                self.evidence.head, self.evidence.base)
+        self.assertEqual(record['original'], output)
+        self.assertEqual(record['current']['findings'], [finding])
+        with patch.object(self.reviewer, 'invoke', side_effect=AssertionError('No model call needed')):
+            repaired = review.recover_citations(archive, record, self.reviewer, self.github, self.evidence)
+        self.assertEqual(repaired['findings'], [{**finding, 'line': 1}])
+        review.validate_result(repaired, self.evidence)
+        self.assertEqual(record['original']['findings'], [finding])
+
+    def test_final_unresolved_quote_is_retained_without_repeating_analysis(self):
+        finding = {**self.finding(), 'evidence': 'invented quote'}
+
+        def model(prompt, **options):
+            data = self.data(prompt)
+            return self.response(data, findings=[finding]
+                                 if data['evidence_batch']['phase'] == 'integration' else [])
+
+        output = self.run_review(model)
+        archive = review.review_drafts.Drafts(self.tmp.name)
+        record = archive.latest(self.evidence.repo, self.evidence.number,
+                                self.evidence.head, self.evidence.base)
+        response = {'corrections': [], 'unresolved': [{'finding_index': 0, 'reason': 'Cannot verify.'}]}
+        with patch.object(self.reviewer, 'invoke', return_value=response) as model:
+            for _ in range(2):
+                with self.assertRaises(review.CitationError):
+                    review.recover_citations(archive, record, self.reviewer, self.github, self.evidence)
+                record = archive.latest(self.evidence.repo, self.evidence.number,
+                                        self.evidence.head, self.evidence.base)
+            self.assertEqual(model.call_count, 1)
+        self.assertEqual(record['original'], output)
+        self.assertEqual(record['current']['findings'], [finding])
+        self.assertEqual(record['issues'][0]['reason'], 'quote_mismatch')
+        self.assertEqual(self.github.submitted, [])
+
     def test_final_pass_cannot_silently_drop_a_candidate_finding(self):
         def model(prompt, **options):
             data = self.data(prompt)
