@@ -41,18 +41,21 @@ def review_result(job, output, url, ci, *, stamp=False):
     blockers = [item for item in findings if item['blocking']]
     notes = [item for item in findings if not item['blocking']]
     verdict = 'Stamped' if stamp else 'Changes requested' if blockers else 'Approved'
-    lines = [f"{job['repo']}#{job['number']} — {verdict}", '',
-             'Approved as requested without code review.' if stamp else plain(paragraphs(output['summary']))]
-    for label, items in [('Required fixes', blockers), ('Non-blocking concerns', notes)]:
+    lines = [f"{job['repo']}#{job['number']} — {verdict}"]
+    if stamp:
+        lines += ['', 'Approved as requested without code review.']
+    elif not findings:
+        lines += ['', plain(paragraphs(output['summary']))]
+    for label, items in [('Required', blockers), ('Also', notes)]:
         if items:
-            lines += ['', f'{label} ({len(items)}):']
+            lines += ['', f'*{label}*']
             for item in items:
                 title = plain(' '.join(item['title'].split()))
                 fix = plain(' '.join(item['fix'].split()))
-                lines += [f'• {title}', f'  Next: {fix}']
-    if not stamp:
-        lines += ['', validation(ci)]
-    lines += ['', f"<{url}|GitHub review> · Commit: {job['head'][:8]}"]
+                lines.append(f'• *{title}* — {fix}')
+    footer = [] if stamp else [validation(ci).replace('Tests were not run.', 'Tests not run').removesuffix('.')]
+    footer += [f"<{url}|Review>", "Commit: " + job['head'][:8]]
+    lines += ['', ' · '.join(footer)]
     return '\n'.join(lines)
 
 
