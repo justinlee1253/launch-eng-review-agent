@@ -25,8 +25,8 @@ def snapshot(evidence):
 
 
 class Drafts:
-    def __init__(self, runtime):
-        self.directory = Path(runtime) / 'drafts'
+    def __init__(self, runtime, *, feedback=False):
+        self.directory = Path(runtime) / ('feedback-drafts' if feedback else 'drafts')
         if self.directory.is_symlink():
             raise DraftError('Review draft directory cannot be a symlink.')
         try:

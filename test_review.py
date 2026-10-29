@@ -66,8 +66,9 @@ class GitHub:
 
     def submit(self, job, payload):
         self.submitted.append(payload)
-        response = {'id': 123, 'html_url': 'https://github.com/ROKT/launch-engineering/pull/6000#pullrequestreview-123',
-                    'state': 'APPROVED' if payload['event'] == 'APPROVE' else 'CHANGES_REQUESTED',
+        review_id = 122 + len(self.submitted)
+        response = {'id': review_id, 'html_url': f"https://github.com/{job['repo']}/pull/{job['number']}#pullrequestreview-{review_id}",
+                    'state': {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED', 'COMMENT': 'COMMENTED'}[payload['event']],
                     'user': {'login': self.login}, 'commit_id': payload['commit_id'], 'body': payload['body']}
         self.timeline.append(response)
         if self.move_after_post:
