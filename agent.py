@@ -35,6 +35,16 @@ REACTIONS = {'picked_up': '👀', 'approved': '✅', 'changes_requested': '💬'
 LOG = logging.getLogger('review-agent')
 
 
+def reaction_emoji(value):
+    if value.startswith('customEmojis/'):
+        return {'customEmoji': {'name': value}}
+    return {'unicode': value}
+
+
+def emoji_key(emoji):
+    return emoji.get('customEmoji', {}).get('name') or emoji.get('unicode')
+
+
 def utc(value=None):
     return (value or datetime.now(timezone.utc)).isoformat(timespec='microseconds').replace('+00:00', 'Z')
 
@@ -66,9 +76,11 @@ class Config:
         if self.poll_seconds != 2 or self.actor != 'justinlee1253' or self.self_user != SELF_USER:
             raise ConfigError('This pilot uses the agreed two-second interval and Justin identities.')
         if (not isinstance(self.reactions, dict) or set(self.reactions) != set(REACTIONS)
-                or any(not isinstance(v, str) or not v.strip() or len(v) > 16
-                       or any(ord(c) < 32 for c in v) for v in self.reactions.values())):
-            raise ConfigError('Configure one Unicode emoji for each of picked_up, approved, changes_requested, warning.')
+                or any(not isinstance(v, str) or not (
+                    re.fullmatch(r'customEmojis/[A-Za-z0-9_-]{1,100}', v)
+                    or (v.strip() and len(v) <= 16 and not v.startswith(('customEmojis', ':'))
+                        and not any(ord(c) < 32 for c in v))) for v in self.reactions.values())):
+            raise ConfigError('Configure a Unicode emoji or customEmojis/ID for each review status.')
         if not set(self.context_repositories).issubset(REPOS):
             raise ConfigError('Only ROKT/launch-engineering is currently enabled for reviews and context.')
 
@@ -204,12 +216,12 @@ class Store:
 
     def _reaction(self, message, emoji):
         id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'reaction:' + message))
-        managed = set(self.reactions.values()) | {emoji}
+        managed = set(REACTIONS.values()) | set(self.reactions.values()) | {emoji}
         for row in self.db.execute("select payload from outbox where kind='reaction' and target=?", (message,)):
             old = json.loads(row['payload'])
             managed.update(old.get('managed_emojis', []))
-            managed.add(old['emoji']['unicode'])
-        payload = json.dumps({'emoji': {'unicode': emoji}, 'managed_emojis': sorted(managed)})
+            managed.add(emoji_key(old['emoji']))
+        payload = json.dumps({'emoji': reaction_emoji(emoji), 'managed_emojis': sorted(managed)})
         self.db.execute("update outbox set status='superseded' where kind='reaction' and target=? and id<>?", (message, id))
         self.db.execute("""insert into outbox(id,kind,target,payload) values(?,'reaction',?,?)
             on conflict(id) do update set payload=excluded.payload,status='pending',attempts=0,next_at=0,sent_at=null
@@ -595,7 +607,7 @@ class Chat:
 
     def sync_reaction(self, message, payload):
         resource = message + '/reactions'
-        desired = payload['emoji']['unicode']
+        desired = emoji_key(payload['emoji'])
         managed = set(payload.get('managed_emojis', self.config.reactions.values())) | {desired}
         statuses, token = [], None
         for _ in range(3):
@@ -604,7 +616,7 @@ class Chat:
                 params['pageToken'] = token
             page = self.request('GET', resource, params=params)
             for reaction in page.get('reactions', []):
-                if reaction.get('user', {}).get('name') != self.config.self_user or reaction.get('emoji', {}).get('unicode') not in managed:
+                if reaction.get('user', {}).get('name') != self.config.self_user or emoji_key(reaction.get('emoji', {})) not in managed:
                     continue
                 if not re.fullmatch(re.escape(resource) + r'/[A-Za-z0-9_.-]+', reaction.get('name', '')):
                     raise ConfigError('Reaction resource does not belong to the requested message.')
@@ -614,14 +626,14 @@ class Chat:
                 break
         if token:
             raise TemporaryFailure('reaction_list_incomplete')
-        obsolete = [r for r in statuses if r['emoji']['unicode'] != desired]
+        obsolete = [r for r in statuses if emoji_key(r['emoji']) != desired]
         if obsolete and not can_update_reactions(self.credentials):
             raise ConfigError('Replacing status requires the explicit reaction-permission upgrade; no browser was opened.')
         # Delete first so a transition never deliberately displays two agent statuses.
         for reaction in obsolete:
             self.request('DELETE', reaction['name'])
-        current = next((r for r in statuses if r['emoji']['unicode'] == desired), None)
-        return current or self.request('POST', resource, json={'emoji': {'unicode': desired}})
+        current = next((r for r in statuses if emoji_key(r['emoji']) == desired), None)
+        return current or self.request('POST', resource, json={'emoji': reaction_emoji(desired)})
 
 
 def scan_once(config, store, chat, cutoff=None):
