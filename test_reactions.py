@@ -9,6 +9,19 @@ from test_agent import SPACE, START, END, message
 REACTION_SCOPE = 'https://www.googleapis.com/auth/chat.messages.reactions'
 
 class ReactionTests(unittest.TestCase):
+    def test_custom_acknowledgement_transitions_to_final_status(self):
+        reactions = {**agent.REACTIONS, 'picked_up': 'customEmojis/alien-acknowledged'}
+        config = agent.Config(SPACE, START, reactions=reactions)
+        self.store.reactions = reactions
+        self.store.ingest(config, [message()], START, END, None)
+        payload = json.loads(self.store.db.execute("select payload from outbox where kind='reaction'").fetchone()[0])
+        self.assertEqual(payload['emoji'], {'customEmoji': {'name': reactions['picked_up']}})
+        job = self.store.claim()
+        self.store.finish(job, 'submitted', 'Clean', 'approved')
+        payload = json.loads(self.store.db.execute("select payload from outbox where kind='reaction'").fetchone()[0])
+        self.assertEqual(payload['emoji'], {'unicode': '✅'})
+        self.assertIn(reactions['picked_up'], payload['managed_emojis'])
+
     def test_custom_emoji_configuration_and_validation(self):
         reactions = {**agent.REACTIONS, 'approved': 'customEmojis/alien-approved'}
         self.assertEqual(agent.Config(SPACE, START, reactions=reactions).reactions, reactions)
