@@ -36,11 +36,11 @@ def validation(ci):
     return 'Tests were not run. CI: ' + description + '.'
 
 
-def review_result(job, output, url, ci, *, stamp=False):
+def review_result(job, output, url, ci, *, stamp=False, feedback=False):
     findings = output.get('findings', [])
     blockers = [item for item in findings if item['blocking']]
     notes = [item for item in findings if not item['blocking']]
-    verdict = 'Stamped' if stamp else 'Changes requested' if blockers else 'Approved'
+    verdict = 'Draft feedback' if feedback else 'Stamped' if stamp else 'Changes requested' if blockers else 'Approved'
     lines = [f"{job['repo']}#{job['number']} — {verdict}"]
     if stamp:
         lines += ['', 'Approved as requested without code review.']
@@ -53,8 +53,10 @@ def review_result(job, output, url, ci, *, stamp=False):
                 title = plain(' '.join(item['title'].split()))
                 fix = plain(' '.join(item['fix'].split()))
                 lines.append(f'• *{title}* — {fix}')
+    if feedback:
+        lines += ['', 'Feedback only; no approval or request-changes verdict was submitted.']
     footer = [] if stamp else [validation(ci).replace('Tests were not run.', 'Tests not run').removesuffix('.')]
-    footer += [f"<{url}|Review>", "Commit: " + job['head'][:8]]
+    footer += [f"<{url}|{'GitHub feedback' if feedback else 'Review'}>", "Commit: " + job['head'][:8]]
     lines += ['', ' · '.join(footer)]
     return '\n'.join(lines)
 
