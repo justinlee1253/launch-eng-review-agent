@@ -47,6 +47,7 @@ class DraftFeedbackTests(unittest.TestCase):
         self.assertEqual(self.github.submitted[0]['commit_id'], HEAD)
         self.assertIn('Draft feedback', self.github.submitted[0]['body'])
         self.assertIn('Draft feedback', job['result'])
+        self.assertIn('Feedback only; no approval or request-changes verdict was submitted.', job['result'])
         self.assertIn('#pullrequestreview-123', job['result'])
         self.assertNotIn('— Approved', job['result'])
         self.assertEqual(self.store.db.execute('select count(*) from ledger').fetchone()[0], 0)
@@ -57,7 +58,11 @@ class DraftFeedbackTests(unittest.TestCase):
         payload = self.github.submitted[0]
         self.assertEqual(payload['event'], 'COMMENT')
         self.assertEqual(payload['comments'][0]['line'], 1)
-        self.assertIn('Next:', job['result'])
+        self.assertIn('Feedback only; no approval or request-changes verdict was submitted.', job['result'])
+        self.assertIn('|GitHub feedback>', job['result'].splitlines()[-1])
+        self.assertNotIn('Next:', job['result'])
+        self.assertTrue(any(finding()['title'] in line and finding()['fix'] in line
+                            for line in job['result'].splitlines()))
         self.assertNotIn('— Changes requested', job['result'])
         reactions = [json.loads(row[0])['emoji']['unicode'] for row in self.store.db.execute("select payload from outbox where kind='reaction'")]
         self.assertEqual(reactions, ['💬'])

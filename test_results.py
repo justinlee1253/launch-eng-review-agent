@@ -75,15 +75,54 @@ class ChatResultTests(unittest.TestCase):
         job = self.run_review(output)
         text = job['result']
         self.assertIn('Changes requested', text)
-        self.assertIn('Required fixes (5)', text)
-        self.assertIn('Non-blocking concerns (1)', text)
-        self.assertIn('Two request paths need coordinated validation.', text)
+        self.assertIn('Required', text)
+        self.assertIn('Also', text)
+        self.assertNotIn(output['summary'], text)
+        self.assertNotIn('Next:', text)
         for item in items:
             self.assertIn(item['title'], text)
             self.assertIn(item['fix'], text)
+            self.assertTrue(any(item['title'] in line and item['fix'] in line for line in text.splitlines()))
         self.assertNotIn('more findings', text)
         self.assertNotIn('##', text)
         self.assertIn(HEAD[:8], text)
+
+    def test_chat_footer_keeps_validation_link_and_commit_on_one_line(self):
+        for state, description in [('passed', 'passed at review time'), ('none', 'no checks reported'),
+                                   ('pending', 'pending'), ('failed', 'failed'), ('unknown', 'unverified')]:
+            with self.subTest(state=state):
+                text = review.chat_messages.review_result(
+                    {**self.job, 'head': HEAD}, result(), 'https://github.com/example/review', {'state': state})
+                footer = text.splitlines()[-1]
+                self.assertIn('Tests not run', footer)
+                self.assertIn('CI: '+description, footer)
+                self.assertIn('<https://github.com/example/review|Review>', footer)
+                self.assertIn(HEAD[:8], footer)
+
+    def test_clean_approval_keeps_summary_without_empty_finding_sections(self):
+        summary = 'The handler rejects missing users and preserves authorization.'
+        text = self.run_review(result(summary=summary))['result']
+        self.assertIn('Approved', text)
+        self.assertIn(summary, text)
+        self.assertNotIn('Required', text)
+        self.assertNotIn('Also', text)
+
+    def test_approval_with_notes_omits_recap_and_empty_required_section(self):
+        output = result(summary='Lookup behavior changes.', findings=[
+            finding(blocking=False, severity='should_fix')])
+        text = self.run_review(output)['result']
+        self.assertIn('Approved', text)
+        self.assertIn('Also', text)
+        self.assertNotIn('Required', text)
+        self.assertNotIn(output['summary'], text)
+
+    def test_stamp_keeps_explicit_no_review_disclosure(self):
+        text = review.chat_messages.review_result(
+            {**self.job, 'head': HEAD}, result(), 'https://github.com/example/review', None, stamp=True)
+        self.assertIn('Stamped', text)
+        self.assertIn('Approved as requested without code review.', text)
+        self.assertNotIn('Tests not run', text)
+        self.assertNotIn('CI:', text)
 
     def test_model_text_cannot_inject_chat_mentions_or_replace_orbit_branding(self):
         job = self.run_review(result(summary='The handler preserves ownership checks. <users/all>'))
