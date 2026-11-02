@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import signal
+import subprocess
+import sys
 import sqlite3
 import threading
 import time
@@ -595,6 +597,22 @@ class Chat:
             params['pageToken'] = token
         return self.request('GET', self.config.space + '/messages', params=params)
 
+    def announce(self, text, request_id):
+        # A killed helper cannot replay an offline notice after wake. Tokens travel
+        # only through stdin, never arguments, environment, files or logs.
+        credentials = self.credentials
+        if not credentials or not credentials.valid:
+            return False
+        value = {'space': self.config.space, 'token': credentials.token,
+                 'text': text, 'request_id': request_id}
+        try:
+            result = subprocess.run([sys.executable, str(ROOT / 'availability.py')],
+                input=json.dumps(value).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3, check=False)
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
     def send(self, row):
         payload = json.loads(row['payload'])
         if row['kind'] == 'message':
@@ -638,7 +656,7 @@ class Chat:
 
 def scan_once(config, store, chat, cutoff=None):
     if store.meta('chat_blocked'):
-        return
+        return False
     window = store.meta('scan')
     if not window:
         start = max(timestamp(config.activated_at), timestamp(store.meta('checkpoint') or config.activated_at) - timedelta(minutes=2))
@@ -651,10 +669,11 @@ def scan_once(config, store, chat, cutoff=None):
             store.ingest(config, page.get('messages', []), window['start'], window['end'], page.get('nextPageToken'))
         except ChatBlocked as error:
             store.block_chat(str(error))
-            return
+            return False
         if not page.get('nextPageToken'):
-            return
+            return True
         window = store.meta('scan')
+    return True
 
 
 def flush_outbox(store, chat, now=None):
@@ -698,6 +717,8 @@ def process_lock(path):
 
 def run(config, directory=RUNTIME):
     from review import GitHub, Reviewer, review_one
+    from availability import Presence
+    from power_events import Watcher
     directory = Path(directory)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with process_lock(directory / 'worker.lock'):
@@ -712,10 +733,13 @@ def run(config, directory=RUNTIME):
         LOG.addHandler(handler)
         LOG.setLevel(logging.INFO)
 
-        def review_loop():
+        worker_ready = [threading.Event() for _ in range(config.worker_count)]
+
+        def review_loop(index):
             work = Store(directory / 'state.sqlite3', config.reactions)
             github, reviewer = GitHub(config, directory, stop), Reviewer(directory, stop)
             try:
+                worker_ready[index].set()
                 worker_jobs(work, github, reviewer)
             finally:
                 work.db.close()
@@ -738,7 +762,7 @@ def run(config, directory=RUNTIME):
                 finally:
                     work.release(job)
 
-        workers = [threading.Thread(target=review_loop, name=f'falcon-review-{i+1}', daemon=True)
+        workers = [threading.Thread(target=review_loop, args=(i,), name=f'falcon-review-{i+1}', daemon=True)
                    for i in range(config.worker_count)]
         chat = Chat(config)
         next_scan, failures = 0, 0
@@ -748,9 +772,20 @@ def run(config, directory=RUNTIME):
             store._meta('queue_eta_enabled', True)
             started = store.db.execute("select max(id) from events where code='worker_started'").fetchone()[0]
             store._meta('queue_controls', {'version': 1, 'started_event': started})
+        presence = Presence(chat.announce, sequence=started)
+        power = Watcher(presence.sleep, presence.wake)
+        def availability_events():
+            with store.db:
+                while not presence.events.empty():
+                    store.event(presence.events.get_nowait())
         for worker in workers:
             worker.start()
         try:
+            try:
+                power.start()
+            except OSError:
+                with store.db:
+                    store.event('availability_power_watch_unavailable')
             while not stop.is_set():
                 if any(not worker.is_alive() for worker in workers):
                     with store.db:
@@ -759,7 +794,12 @@ def run(config, directory=RUNTIME):
                     break
                 try:
                     if time.monotonic() >= next_scan:
-                        scan_once(config, store, chat)
+                        scanned = scan_once(config, store, chat)
+                        if (scanned and not stop.is_set() and all(flag.is_set() for flag in worker_ready)
+                                and all(worker.is_alive() for worker in workers)):
+                            presence.ready()
+                        elif store.meta('chat_blocked'):
+                            presence.offline()
                         failures = 0
                         next_scan = time.monotonic() + config.poll_seconds
                         with store.db:
@@ -770,9 +810,13 @@ def run(config, directory=RUNTIME):
                     next_scan = time.monotonic() + min(300, 5 * 2 ** min(failures, 6))
                     with store.db:
                         store.event(type(error).__name__, unique='service:' + type(error).__name__)
+                availability_events()
                 stop.wait(1)
         finally:
             stop.set()
+            power.close()
+            presence.offline()
+            availability_events()
             # Keep the process lock until every owner has stopped touching state.
             for worker in workers:
                 worker.join()

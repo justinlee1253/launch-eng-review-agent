@@ -65,6 +65,7 @@ class RuntimeTests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         handlers, acknowledgments, observed = {}, [], []
         class Chat:
+            announce = staticmethod(lambda *args: True)
             polls = 0
             def __init__(inner, config):
                 pass
@@ -97,7 +98,7 @@ class RuntimeTests(unittest.TestCase):
         timer.start()
         try:
             with tempfile.TemporaryDirectory() as directory:
-                with patch('agent.Chat', Chat), patch('agent.signal.signal', side_effect=signal_handler), \
+                with patch('availability.Presence'), patch('power_events.Watcher'), patch('agent.Chat', Chat), patch('agent.signal.signal', side_effect=signal_handler), \
                      patch('review.GitHub', side_effect=lambda *args, **kwargs: GitHub()), patch('review.Reviewer', Reviewer):
                     agent.run(agent.Config(SPACE, START), directory)
                 self.assertEqual(observed, [True])
