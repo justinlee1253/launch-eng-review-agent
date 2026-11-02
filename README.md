@@ -25,9 +25,9 @@ Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are subm
 
 ### Availability notices
 
-The agent posts one crew-style line in the configured space after a successful Chat poll and worker initialization, and another when stopping or entering macOS sleep. Five online and five offline lines rotate. After wake, a fresh successful poll is required before announcing online again. These notices use the existing Chat grant and never open a consent screen.
+The agent posts one crew-style line in the configured space after a successful Chat poll and worker initialization, and another when entering macOS sleep. Five online and five offline lines rotate. Notices are recorded against the laptop's boot/wake identity in the existing SQLite state, so routine worker restarts, deployments, polls and reviews stay silent. After a real wake, a fresh successful poll is required before announcing online again. These notices use the existing Chat grant and never open a consent screen.
 
-Offline delivery is best effort with a three-second deadline. Power loss, crashes, lost network access or an expired cached token can prevent a notice; there is no external uptime monitor. Failed offline messages are never queued for replay after wake. The sleep observer does not prevent sleep or schedule wakes. Availability transitions and delivery failures appear in the activity log.
+Offline delivery is best effort with a three-second deadline. A full shutdown without a sleep notification, power loss, crashes, lost network access or an expired cached token can prevent a notice; there is no external uptime monitor. A worker stop alone is not treated as laptop sleep. Failed offline messages are never queued for replay after wake. The sleep observer does not prevent sleep or schedule wakes. Availability transitions and delivery failures appear in the activity log.
 
 ### STAMP exception
 

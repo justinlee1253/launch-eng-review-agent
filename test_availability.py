@@ -19,6 +19,55 @@ class AvailabilityTests(unittest.TestCase):
             return next(outcomes)
         return availability.Presence(send), sent
 
+    def test_restarting_workers_in_same_laptop_cycle_does_not_repeat_notices(self):
+        import availability
+        from pathlib import Path
+        sent = []
+        def send(text, request_id):
+            sent.append((text, request_id))
+            return True
+        with tempfile.TemporaryDirectory() as root, patch('availability.laptop_cycle', return_value='boot1:wake1'):
+            store = agent.Store(Path(root) / 'state.sqlite3')
+            self.addCleanup(store.db.close)
+            first = availability.Presence(send, state_path=store.path)
+            first.ready()
+            restarted = availability.Presence(send, state_path=store.path)
+            restarted.ready()
+            restarted.sleep()
+            restarted.sleep()
+            self.assertEqual(len(sent), 2)
+            self.assertTrue(sent[0][0].startswith('🟢'))
+            self.assertTrue(sent[1][0].startswith('🌙'))
+            another = availability.Presence(send, state_path=store.path)
+            another.ready()
+            another.sleep()
+            self.assertEqual(len(sent), 2)
+            with patch('availability.laptop_cycle', return_value='boot1:wake2'):
+                another.wake()
+                another.ready()
+            self.assertEqual(len(sent), 3)
+            self.assertNotEqual(sent[0][1], sent[2][1])
+
+    def test_upgrade_reuses_notice_already_sent_during_this_wake(self):
+        import availability
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as root, patch('availability.laptop_cycle', return_value='boot:1:0'):
+            store = agent.Store(Path(root) / 'state.sqlite3')
+            self.addCleanup(store.db.close)
+            with store.db:
+                store.event('availability_online_sent')
+            send = Mock(return_value=True)
+            presence = availability.Presence(send, state_path=store.path)
+            presence.ready()
+            send.assert_not_called()
+
+    def test_cold_boot_identity_uses_boot_time_when_no_wake_has_occurred(self):
+        import availability
+        boot = '12345678-1234-1234-1234-123456789012'
+        output = f'{boot}\n{{ sec = 0, usec = 0 }}\n{{ sec = 123, usec = 456 }}\n'.encode()
+        with patch('availability.subprocess.run', return_value=SimpleNamespace(stdout=output)):
+            self.assertEqual(availability.laptop_cycle(), boot + ':123:456')
+
     def test_one_notice_per_transition_rotates_without_em_dashes(self):
         presence, sent = self.make_presence()
         for _ in range(5):
@@ -144,7 +193,7 @@ class AvailabilityTests(unittest.TestCase):
             agent.run(agent.Config(SPACE, START), root)
         self.assertEqual(sent, [])
 
-    def test_runtime_announces_only_after_successful_scan_and_stops_offline(self):
+    def test_runtime_announces_after_successful_scan_but_restart_stays_silent(self):
         handlers, sent = {}, []
         ready = threading.Event()
         class Client:
@@ -166,13 +215,12 @@ class AvailabilityTests(unittest.TestCase):
         self_test = self
         with tempfile.TemporaryDirectory() as root, patch('agent.Chat', Chat), \
              patch('review.GitHub', Client), patch('review.Reviewer', Client), \
-             patch('power_events.Watcher') as watcher, \
+             patch('power_events.Watcher') as watcher, patch('availability.laptop_cycle', return_value='test-boot:wake'), \
              patch('agent.signal.signal', side_effect=lambda sig, callback: handlers.update({sig: callback})):
             agent.run(agent.Config(SPACE, START), root)
             watcher.return_value.close.assert_called_once()
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent), 1)
         self.assertTrue(sent[0].startswith('🟢'))
-        self.assertTrue(sent[1].startswith('🌙'))
 
 
 if __name__ == '__main__':
