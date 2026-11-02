@@ -23,6 +23,12 @@ Every PR request message, including thread replies, has one current agent status
 
 Current scope is `ROKT/launch-engineering`, including `Orbit/`. Reviews are submitted as `justinlee1253`. Everyone in the designated space, including the operator, can request a review. The agent ignores its own outgoing replies and bot messages; PRs authored by either configured operator GitHub identity remain excluded. This deployment is deliberately scoped; cloning it does not provision another identity or authorize additional repositories.
 
+### Availability notices
+
+The agent posts one crew-style line in the configured space after a successful Chat poll and worker initialization, and another when stopping or entering macOS sleep. Five online and five offline lines rotate. After wake, a fresh successful poll is required before announcing online again. These notices use the existing Chat grant and never open a consent screen.
+
+Offline delivery is best effort with a three-second deadline. Power loss, crashes, lost network access or an expired cached token can prevent a notice; there is no external uptime monitor. Failed offline messages are never queued for replay after wake. The sleep observer does not prevent sleep or schedule wakes. Availability transitions and delivery failures appear in the activity log.
+
 ### STAMP exception
 
 Only users with explicit STAMP permission may request an approval without code review. Contact Justin Lee at [justin.lee@rokt.com](mailto:justin.lee@rokt.com) to request access. Permission is checked against the sender's verified Google Chat identity.

@@ -144,6 +144,7 @@ class WorkerTests(unittest.TestCase):
         handlers, clients, send_threads, errors = {}, [], set(), []
         test = self
         class Chat:
+            announce = staticmethod(lambda *args: True)
             polls = 0
             def __init__(inner, config):
                 clients.append(('chat', threading.get_ident()))
@@ -181,7 +182,7 @@ class WorkerTests(unittest.TestCase):
             else:
                 third.set()
             store.finish(job, 'submitted', 'done', 'approved')
-        with patch('agent.Chat', Chat), patch('review.GitHub', Client), patch('review.Reviewer', Client), \
+        with patch('availability.Presence'), patch('power_events.Watcher'), patch('agent.Chat', Chat), patch('review.GitHub', Client), patch('review.Reviewer', Client), \
              patch('review.review_one', side_effect=fake_review), \
              patch('agent.signal.signal', side_effect=lambda sig, callback: handlers.update({sig:callback})):
             agent.run(agent.Config(SPACE, START, worker_count=2), self.tmp.name)
