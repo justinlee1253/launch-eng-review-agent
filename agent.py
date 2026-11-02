@@ -772,7 +772,7 @@ def run(config, directory=RUNTIME):
             store._meta('queue_eta_enabled', True)
             started = store.db.execute("select max(id) from events where code='worker_started'").fetchone()[0]
             store._meta('queue_controls', {'version': 1, 'started_event': started})
-        presence = Presence(chat.announce, sequence=started)
+        presence = Presence(chat.announce, sequence=started, state_path=store.path)
         power = Watcher(presence.sleep, presence.wake)
         def availability_events():
             with store.db:
@@ -798,8 +798,6 @@ def run(config, directory=RUNTIME):
                         if (scanned and not stop.is_set() and all(flag.is_set() for flag in worker_ready)
                                 and all(worker.is_alive() for worker in workers)):
                             presence.ready()
-                        elif store.meta('chat_blocked'):
-                            presence.offline()
                         failures = 0
                         next_scan = time.monotonic() + config.poll_seconds
                         with store.db:
@@ -815,7 +813,6 @@ def run(config, directory=RUNTIME):
         finally:
             stop.set()
             power.close()
-            presence.offline()
             availability_events()
             # Keep the process lock until every owner has stopped touching state.
             for worker in workers:
