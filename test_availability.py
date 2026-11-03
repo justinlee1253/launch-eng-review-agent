@@ -144,6 +144,46 @@ class AvailabilityTests(unittest.TestCase):
             post.assert_called_once()
         chat.manager.load.assert_not_called()
 
+    def test_notice_failures_log_only_safe_reason_and_duration(self):
+        import subprocess
+        chat = agent.Chat(agent.Config(SPACE, START), manager=Mock())
+        chat.credentials = SimpleNamespace(valid=True, token='private-token')
+        failures = (
+            (SimpleNamespace(returncode=1, stdout=b'http_403\n'), None, 'http_403'),
+            (SimpleNamespace(returncode=1, stdout=b'private-token raw response'), None, 'helper_failed'),
+            (None, subprocess.TimeoutExpired('private-token', 3), 'deadline'),
+        )
+        for result, error, reason in failures:
+            with self.subTest(reason=reason), patch('agent.subprocess.run', return_value=result, side_effect=error), \
+                    self.assertLogs(agent.LOG, level='WARNING') as logs:
+                self.assertFalse(chat.announce('🌙 Crew, we’re parked for now. Reviews are paused.', 'fixed-id'))
+            text = ' '.join(logs.output)
+            self.assertIn('state=offline', text)
+            self.assertIn('reason=' + reason, text)
+            self.assertIn('elapsed_ms=', text)
+            self.assertNotIn('private-token', text)
+        chat.credentials.valid = False
+        with self.assertLogs(agent.LOG, level='WARNING') as logs:
+            self.assertFalse(chat.announce('offline', 'fixed-id'))
+        self.assertIn('reason=cached_token_unavailable', ' '.join(logs.output))
+        with self.assertNoLogs(agent.LOG, level='WARNING'):
+            self.assertFalse(chat.announce('offline', 'fixed-id'))
+        chat.manager.load.assert_not_called()
+
+    def test_delivery_outcome_reports_http_and_network_failures_safely(self):
+        import availability
+        import requests
+        value = {'space': SPACE, 'token': 'private-token', 'text': availability.OFFLINE[0], 'request_id': 'fixed-id'}
+        for error, expected in ((requests.Timeout('private-token'), 'network_timeout'),
+                                (requests.ConnectionError('private-token'), 'connection_failed')):
+            with self.subTest(expected=expected), patch('requests.post', side_effect=error):
+                self.assertEqual(availability.delivery_outcome(value), expected)
+        response = Mock(status_code=403)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch('requests.post', return_value=response):
+            self.assertEqual(availability.delivery_outcome(value), 'http_403')
+
     def test_stalled_notice_helper_is_actually_terminated(self):
         import time
         from pathlib import Path
