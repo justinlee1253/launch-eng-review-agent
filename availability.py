@@ -148,14 +148,30 @@ def deliver(value):
     with requests.post('https://chat.googleapis.com/v1/' + value['space'] + '/messages',
             headers={'Authorization': 'Bearer ' + value['token']}, json={'text': value['text']},
             params={'requestId': value['request_id']}, timeout=(1, 1), allow_redirects=False, stream=True) as response:
-        return 200 <= response.status_code < 300
+        if not 200 <= response.status_code < 300:
+            raise requests.HTTPError(response=response)
+        return True
+
+
+def delivery_outcome(value):
+    import requests
+    try:
+        return 'sent' if deliver(value) else 'invalid_request'
+    except requests.Timeout:
+        return 'network_timeout'
+    except requests.ConnectionError:
+        return 'connection_failed'
+    except requests.HTTPError as error:
+        return 'http_' + str(error.response.status_code)
+    except Exception:
+        return 'helper_failed'
 
 
 if __name__ == '__main__':
-    import json
     import sys
     try:
-        success = deliver(json.load(sys.stdin))
+        outcome = delivery_outcome(json.load(sys.stdin))
     except Exception:
-        success = False
-    raise SystemExit(0 if success else 1)
+        outcome = 'invalid_request'
+    print(outcome)
+    raise SystemExit(0 if outcome == 'sent' else 1)

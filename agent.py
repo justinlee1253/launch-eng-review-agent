@@ -598,20 +598,34 @@ class Chat:
         return self.request('GET', self.config.space + '/messages', params=params)
 
     def announce(self, text, request_id):
-        # A killed helper cannot replay an offline notice after wake. Tokens travel
-        # only through stdin, never arguments, environment, files or logs.
+        # Tokens travel only through stdin. Only fixed diagnostic codes may return.
+        started = time.monotonic()
         credentials = self.credentials
-        if not credentials or not credentials.valid:
-            return False
-        value = {'space': self.config.space, 'token': credentials.token,
-                 'text': text, 'request_id': request_id}
-        try:
-            result = subprocess.run([sys.executable, str(ROOT / 'availability.py')],
-                input=json.dumps(value).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=3, check=False)
-            return result.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+        reason = 'cached_token_unavailable'
+        if credentials and credentials.valid:
+            value = {'space': self.config.space, 'token': credentials.token,
+                     'text': text, 'request_id': request_id}
+            try:
+                result = subprocess.run([sys.executable, str(ROOT / 'availability.py')],
+                    input=json.dumps(value).encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    timeout=3, check=False)
+                if result.returncode == 0:
+                    self._notice_failure = None
+                    return True
+                code = getattr(result, 'stdout', b'').decode('ascii', errors='replace').strip()
+                reason = code if re.fullmatch(
+                    r'http_[1-5][0-9]{2}|network_timeout|connection_failed|invalid_request|helper_failed', code
+                ) else 'helper_failed'
+            except subprocess.TimeoutExpired:
+                reason = 'deadline'
+            except OSError:
+                reason = 'helper_unavailable'
+        state = 'offline' if text.startswith('🌙') else 'online' if text.startswith('🟢') else 'unknown'
+        if getattr(self, '_notice_failure', None) != (state, reason):
+            LOG.warning('availability_notice_failed state=%s reason=%s elapsed_ms=%s',
+                        state, reason, round((time.monotonic() - started) * 1000))
+            self._notice_failure = (state, reason)
+        return False
 
     def send(self, row):
         payload = json.loads(row['payload'])
