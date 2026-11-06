@@ -5,7 +5,8 @@
   "poll_seconds": 2,
   "actor": "justinlee1253",
   "context_repositories": [
-    "ROKT/launch-engineering"
+    "ROKT/launch-engineering",
+    "ROKT/auth"
   ],
   "reactions": {
     "picked_up": "👀",

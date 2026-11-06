@@ -17,7 +17,7 @@ import traceback
 import uuid
 from urllib.parse import quote
 
-from agent import ConfigError, REPOS, ROOT, Store
+from agent import ConfigError, REPOS, STAMP_REPOS, ROOT, Store
 import messages as chat_messages
 import usage
 import diagnostics
@@ -415,6 +415,11 @@ class GitHub:
             if path in {'AGENTS.md', 'CLAUDE.md'}:
                 evidence.read(self, repo, ancestor, path, optional=True)
         evidence.documents[repo + '@' + head + ':DIRECTORY'] = self.tree(repo, head)
+        if repo == 'ROKT/auth':
+            evidence.scope = {'profile': 'auth', 'affected_paths': sorted(evidence.files)}
+            for path in ('README.md', 'docs/architecture.md'):
+                for ref in (ancestor, head):
+                    evidence.read(self, repo, ref, path, optional=True)
         affected = orbit_context.select(repo, files, patches)
         if affected:
             try:
@@ -1155,6 +1160,8 @@ def review_one(config, store, github, reviewer, job):
         if job['repo'] not in REPOS:
             raise Incomplete('Repository is no longer in the pilot allowlist; no review was posted.')
         stamp = job.get('mode') == 'stamp'
+        if stamp and job['repo'] not in STAMP_REPOS:
+            raise Incomplete('STAMP is limited to ROKT/launch-engineering; request a code review instead.')
         stamp_email = store.stamp_email(job.get('requester')) if stamp else None
         if stamp and not stamp_email:
             raise Incomplete('STAMP requester is not currently authorized; no approval or model run is allowed.')
