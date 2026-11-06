@@ -69,7 +69,8 @@
           "repo": {
             "type": "string",
             "enum": [
-              "ROKT/launch-engineering"
+              "ROKT/launch-engineering",
+              "ROKT/auth"
             ]
           },
           "ref": {

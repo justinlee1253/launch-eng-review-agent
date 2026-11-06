@@ -31,7 +31,8 @@ import messages as chat_messages
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME = ROOT / '.runtime'
-REPOS = ('ROKT/launch-engineering',)
+REPOS = ('ROKT/launch-engineering', 'ROKT/auth')
+STAMP_REPOS = ('ROKT/launch-engineering',)
 SELF_USER = 'users/104386993234033491963'
 REACTIONS = {'picked_up': '👀', 'approved': '✅', 'changes_requested': '💬', 'warning': '⚠️'}
 LOG = logging.getLogger('review-agent')
@@ -84,7 +85,7 @@ class Config:
                         and not any(ord(c) < 32 for c in v))) for v in self.reactions.values())):
             raise ConfigError('Configure a Unicode emoji or customEmojis/ID for each review status.')
         if not set(self.context_repositories).issubset(REPOS):
-            raise ConfigError('Only ROKT/launch-engineering is currently enabled for reviews and context.')
+            raise ConfigError('Only ROKT/launch-engineering and ROKT/auth are enabled for reviews and context.')
 
     @classmethod
     def load(cls, path=RUNTIME / 'config.json'):
@@ -399,11 +400,15 @@ class Store:
                 links = pr_links(text)
                 unsupported = [repo for repo, _ in pr_candidates(text) if repo.casefold() not in {r.casefold() for r in REPOS}]
                 if unsupported:
-                    self._outbox('scope:' + name, 'message', thread, {'text': 'Not queued — this agent supports ROKT/launch-engineering.\nNext: Post a launch-engineering PR link, or ask an agent maintainer about other repositories.', 'thread': {'name': thread}})
+                    self._outbox('scope:' + name, 'message', thread, {'text': 'Not queued — this agent supports ROKT/launch-engineering and ROKT/auth.\nNext: Post a supported PR link, or ask an agent maintainer about other repositories.', 'thread': {'name': thread}})
                     self._reaction(name, config.reactions['warning'])
                 wants_stamp = bool(re.search(r'\bSTAMP\b', text, re.IGNORECASE))
                 mode = 'stamp' if wants_stamp else 'review'
                 if wants_stamp:
+                    if any(repo not in STAMP_REPOS for repo, _ in links):
+                        self._outbox('stamp_scope:' + name, 'message', thread, {'text': 'STAMP is limited to ROKT/launch-engineering.\nNext: Remove STAMP to request an Auth code review.', 'thread': {'name': thread}})
+                        self._reaction(name, config.reactions['warning'])
+                        continue
                     try:
                         authorized = self.stamp_authorized(sender)
                     except ConfigError as error:
