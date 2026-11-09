@@ -25,4 +25,8 @@ jobs:
           printf '#!/bin/sh\nexit 1\n' > "$RUNNER_TEMP/test-bin/codex"
           chmod +x "$RUNNER_TEMP/test-bin/codex"
           echo "$RUNNER_TEMP/test-bin" >> "$GITHUB_PATH"
+      - name: Provide external review guidance fixture
+        run: |
+          sudo mkdir -p /Users/jklee/.codex/skills/avengers-falcon
+          printf 'CI policy fixture; model calls are mocked.\n' | sudo tee /Users/jklee/.codex/skills/avengers-falcon/SKILL.md > /dev/null
       - run: python -m unittest discover -q
