@@ -194,9 +194,31 @@ class GitHub:
         self.directory = Path(directory)
         self.executable = shutil.which('gh')
         self.trees = {}
+        self._token = None
         self.stop = stop
         if not self.executable:
             raise ConfigError('Existing GitHub CLI is required.')
+
+    def environment(self):
+        env = {key: value for key, value in os.environ.items()
+               if key not in {'GH_TOKEN', 'GITHUB_TOKEN', 'GH_DEBUG'}}
+        env.update(GH_PROMPT_DISABLED='1', GIT_TERMINAL_PROMPT='0')
+        if self._token is None:
+            budget = getattr(self, 'budget', None)
+            try:
+                response = subprocess.run([self.executable, 'auth', 'token', '--hostname', 'github.com',
+                    '--user', self.config.actor], capture_output=True,
+                    timeout=budget.remaining(40) if budget else 40, env=env)
+            except (OSError, subprocess.TimeoutExpired):
+                if budget:
+                    budget.remaining()
+                raise GitHubError('Configured GitHub credential lookup failed; no API request was sent.') from None
+            if response.returncode or not response.stdout.strip():
+                raise GitHubError('Configured GitHub credential is unavailable; no API request was sent.')
+            self._token = response.stdout.decode().strip()
+        # Pin every read and write to the same account without changing shared gh state.
+        env['GH_TOKEN'] = self._token
+        return env
 
     def api(self, endpoint, payload=None):
         if getattr(self, 'cancel_guard', None):
@@ -220,9 +242,10 @@ class GitHub:
             diagnostics.emit('github_request_failed', warning=True, **detail)
             return detail
         budget = getattr(self, 'budget', None)
+        env = self.environment()
         timeout = budget.remaining(40) if budget else 40
         try:
-            response = subprocess.run(args, capture_output=True, timeout=timeout, env={**os.environ, 'GH_PROMPT_DISABLED': '1', 'GIT_TERMINAL_PROMPT': '0'})
+            response = subprocess.run(args, capture_output=True, timeout=timeout, env=env)
         except (subprocess.TimeoutExpired, OSError) as error:
             detail = failed('timeout' if isinstance(error, subprocess.TimeoutExpired) else 'process_error',
                             timeout_seconds=timeout if isinstance(error, subprocess.TimeoutExpired) else None,
