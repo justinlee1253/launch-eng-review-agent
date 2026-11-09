@@ -18,6 +18,9 @@ class GitHubRetryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.github = review.GitHub(Config(SPACE, START), Path(self.tmp.name))
+        transport = patch.object(review.GitHub, 'environment', return_value={})
+        transport.start()
+        self.addCleanup(transport.stop)
 
     def test_transient_read_failure_recovers_without_aborting_review(self):
         for failure in [SimpleNamespace(returncode=1, stdout=b'', stderr=b'error connecting to api.github.com'),
