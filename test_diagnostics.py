@@ -22,9 +22,6 @@ class DiagnosticTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.config = Config(SPACE, START)
-        transport = patch.object(review.GitHub, 'environment', return_value={})
-        transport.start()
-        self.addCleanup(transport.stop)
 
     def records(self, logs):
         return [json.loads(row.getMessage()) for row in logs.records]
