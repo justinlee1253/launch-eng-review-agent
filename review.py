@@ -222,7 +222,31 @@ class GitHub:
         budget = getattr(self, 'budget', None)
         timeout = budget.remaining(40) if budget else 40
         try:
-            response = subprocess.run(args, capture_output=True, timeout=timeout, env={**os.environ, 'GH_PROMPT_DISABLED': '1', 'GIT_TERMINAL_PROMPT': '0'})
+            for attempt in range(3):
+                if getattr(self, 'cancel_guard', None):
+                    self.cancel_guard()
+                if self.stop and self.stop.is_set():
+                    raise WorkerStopped('Worker stopped; pending work is retained.')
+                timeout = budget.remaining(40) if budget else 40
+                try:
+                    response = subprocess.run(args, capture_output=True, timeout=timeout,
+                        env={**os.environ, 'GH_PROMPT_DISABLED': '1', 'GIT_TERMINAL_PROMPT': '0'})
+                except subprocess.TimeoutExpired:
+                    if payload or attempt == 2:
+                        raise
+                    category = 'timeout'
+                else:
+                    category = diagnostics.provider_failure(response.stderr)['error_category'] if response.returncode else None
+                    if payload or category not in {'network', 'server_error'} or attempt == 2:
+                        break
+                # Only idempotent reads may retry; uncertain writes require reconciliation.
+                diagnostics.emit('github_read_retry', service='github', method='GET',
+                    endpoint=diagnostics.endpoint_name(endpoint), error_category=category)
+                delay = min(2 ** attempt, budget.remaining()) if budget else 2 ** attempt
+                if self.stop:
+                    self.stop.wait(delay)
+                else:
+                    time.sleep(delay)
         except (subprocess.TimeoutExpired, OSError) as error:
             detail = failed('timeout' if isinstance(error, subprocess.TimeoutExpired) else 'process_error',
                             timeout_seconds=timeout if isinstance(error, subprocess.TimeoutExpired) else None,
