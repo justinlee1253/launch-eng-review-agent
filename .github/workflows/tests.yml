@@ -1,0 +1,32 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.lock
+      - name: Provide a model CLI fixture
+        run: |
+          mkdir -p "$RUNNER_TEMP/test-bin"
+          printf '#!/bin/sh\nexit 1\n' > "$RUNNER_TEMP/test-bin/codex"
+          chmod +x "$RUNNER_TEMP/test-bin/codex"
+          echo "$RUNNER_TEMP/test-bin" >> "$GITHUB_PATH"
+      - name: Provide external review guidance fixture
+        run: |
+          sudo mkdir -p /Users/jklee/.codex/skills/avengers-falcon
+          printf 'CI policy fixture; model calls are mocked.\n' | sudo tee /Users/jklee/.codex/skills/avengers-falcon/SKILL.md > /dev/null
+      - run: python -m unittest discover -q
